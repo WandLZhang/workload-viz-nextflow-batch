@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+*.egg-info/
+
+# Nextflow
+.nextflow/
+.nextflow.log*
+work/
+results/
+backend/*.html
+!frontend/index.html
+
+# Node
+node_modules/
+dist/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+
+# Test/Reference files
+test/
+
+# Environment variables
+.env
+.env.local
