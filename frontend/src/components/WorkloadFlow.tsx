@@ -59,7 +59,7 @@ const SETUP_STEPS = [
   { id: 'enable-apis', label: 'Enable APIs', command: 'Batch, Compute, Logging, IAM', icon: 'api' },
   { id: 'create-sa', label: 'Create Service Account', command: 'nextflow-pipeline-sa', icon: 'person' },
   { id: 'iam-roles', label: 'Add IAM Roles', command: '5 roles granted', icon: 'security' },
-  { id: 'org-policies', label: 'Configure Org Policies', command: 'Shielded VM exception', icon: 'policy' },
+  { id: 'org-policies', label: 'Configure Org Policies', command: 'VM + Image exceptions', icon: 'policy' },
   { id: 'create-network', label: 'Create VPC Network', command: 'default + firewall + PGA', icon: 'lan' },
   { id: 'create-bucket', label: 'Create GCS Bucket', command: 'gs://wz-workload-viz-bucket', icon: 'cloud_upload' },
   { id: 'write-config', label: 'Write Nextflow Config', command: 'nextflow.config', icon: 'settings' },

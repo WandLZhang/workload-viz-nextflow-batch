@@ -62,7 +62,8 @@ def execute_enable_apis():
             'compute.googleapis.com', 
             'logging.googleapis.com',
             'iam.googleapis.com',
-            'cloudresourcemanager.googleapis.com'
+            'cloudresourcemanager.googleapis.com',
+            'orgpolicy.googleapis.com'  
         ]
         
         for api in apis:
@@ -189,46 +190,50 @@ def execute_configure_org_policies():
         
         client = orgpolicy_v2.OrgPolicyClient(credentials=credentials)
         
-        # Policies to configure for Batch compatibility
-        policies = [
-            {
-                'constraint': 'constraints/compute.requireShieldedVm',
-                'description': 'Allow non-Shielded VMs for Batch',
-                'enforced': False
-            },
-            {
-                'constraint': 'constraints/compute.vmExternalIpAccess',
-                'description': 'Allow external IPs (or use usePrivateAddress)',
-                'skip': True  # We handle this via usePrivateAddress instead
-            }
-        ]
+        # 1. Boolean policy: Disable Shielded VM requirement
+        yield log_msg("  Setting compute.requireShieldedVm...")
+        try:
+            policy = orgpolicy_v2.Policy()
+            policy.name = f"projects/{PROJECT_ID}/policies/compute.requireShieldedVm"
+            policy.spec = orgpolicy_v2.PolicySpec()
+            policy.spec.rules = [
+                orgpolicy_v2.PolicySpec.PolicyRule(enforce=False)
+            ]
+            request = orgpolicy_v2.UpdatePolicyRequest(policy=policy)
+            client.update_policy(request=request)
+            yield log_msg("  ✓ compute.requireShieldedVm - exception granted", "success")
+        except Exception as e:
+            if 'already' in str(e).lower() or 'no change' in str(e).lower():
+                yield log_msg("  ✓ compute.requireShieldedVm - already configured", "info")
+            else:
+                yield log_msg(f"  ⚠ compute.requireShieldedVm - {str(e)[:60]}", "info")
         
-        for policy_config in policies:
-            if policy_config.get('skip'):
-                continue
-                
-            constraint = policy_config['constraint']
-            yield log_msg(f"  Setting {constraint}...")
-            
-            try:
-                policy = orgpolicy_v2.Policy()
-                policy.name = f"projects/{PROJECT_ID}/policies/{constraint.split('/')[-1]}"
-                policy.spec = orgpolicy_v2.PolicySpec()
-                policy.spec.rules = [
-                    orgpolicy_v2.PolicySpec.PolicyRule(
-                        enforce=False
+        # 2. List policy: Allow Batch image projects
+        yield log_msg("  Setting compute.trustedImageProjects...")
+        try:
+            policy = orgpolicy_v2.Policy()
+            policy.name = f"projects/{PROJECT_ID}/policies/compute.trustedImageProjects"
+            policy.spec = orgpolicy_v2.PolicySpec()
+            policy.spec.rules = [
+                orgpolicy_v2.PolicySpec.PolicyRule(
+                    values=orgpolicy_v2.PolicySpec.PolicyRule.StringValues(
+                        allowed_values=[
+                            "projects/batch-custom-image",
+                            "projects/cos-cloud",
+                            "projects/debian-cloud",
+                            "projects/ubuntu-os-cloud"
+                        ]
                     )
-                ]
-                
-                request = orgpolicy_v2.UpdatePolicyRequest(policy=policy)
-                client.update_policy(request=request)
-                yield log_msg(f"  ✓ {constraint} - exception granted", "success")
-            except Exception as e:
-                if 'already' in str(e).lower() or 'no change' in str(e).lower():
-                    yield log_msg(f"  ✓ {constraint} - already configured", "info")
-                else:
-                    # Try alternative method using REST API
-                    yield log_msg(f"  ⚠ {constraint} - may need manual config: {str(e)[:60]}", "info")
+                )
+            ]
+            request = orgpolicy_v2.UpdatePolicyRequest(policy=policy)
+            client.update_policy(request=request)
+            yield log_msg("  ✓ compute.trustedImageProjects - batch images allowed", "success")
+        except Exception as e:
+            if 'already' in str(e).lower() or 'no change' in str(e).lower():
+                yield log_msg("  ✓ compute.trustedImageProjects - already configured", "info")
+            else:
+                yield log_msg(f"  ⚠ compute.trustedImageProjects - {str(e)[:60]}", "info")
         
         yield log_msg("  Note: usePrivateAddress=true handles external IP constraint", "info")
         yield step_complete()
