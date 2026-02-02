@@ -58,7 +58,8 @@ const GCP_DIFFERENTIATORS = {
 const SETUP_STEPS = [
   { id: 'enable-apis', label: 'Enable APIs', command: 'Batch, Compute, Logging, IAM', icon: 'api' },
   { id: 'create-sa', label: 'Create Service Account', command: 'nextflow-pipeline-sa', icon: 'person' },
-  { id: 'iam-roles', label: 'Add IAM Roles', command: '4 roles granted', icon: 'security' },
+  { id: 'iam-roles', label: 'Add IAM Roles', command: '5 roles granted', icon: 'security' },
+  { id: 'create-network', label: 'Create VPC Network', command: 'default + firewall', icon: 'lan' },
   { id: 'create-bucket', label: 'Create GCS Bucket', command: 'gs://wz-workload-viz-bucket', icon: 'cloud_upload' },
   { id: 'write-config', label: 'Write Nextflow Config', command: 'nextflow.config', icon: 'settings' },
 ];

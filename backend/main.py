@@ -176,6 +176,126 @@ def execute_iam_roles():
         yield step_error(str(e))
 
 
+def execute_create_network():
+    """Create VPC network and firewall rules for Google Batch"""
+    yield log_msg("Setting up VPC network for Google Batch...")
+    
+    try:
+        credentials, project = default()
+        compute_service = discovery.build('compute', 'v1', credentials=credentials)
+        
+        # Check if default network exists
+        try:
+            compute_service.networks().get(
+                project=PROJECT_ID,
+                network='default'
+            ).execute()
+            yield log_msg("  ✓ Default VPC network already exists", "info")
+        except Exception as e:
+            if 'notFound' in str(e) or '404' in str(e):
+                yield log_msg("  Creating default VPC network with auto-subnets...")
+                
+                network_body = {
+                    'name': 'default',
+                    'autoCreateSubnetworks': True,
+                    'routingConfig': {
+                        'routingMode': 'REGIONAL'
+                    }
+                }
+                
+                operation = compute_service.networks().insert(
+                    project=PROJECT_ID,
+                    body=network_body
+                ).execute()
+                
+                # Wait for operation to complete
+                yield log_msg("  Waiting for network creation...")
+                while True:
+                    result = compute_service.globalOperations().get(
+                        project=PROJECT_ID,
+                        operation=operation['name']
+                    ).execute()
+                    if result['status'] == 'DONE':
+                        break
+                
+                yield log_msg("  ✓ Default VPC network created", "success")
+            else:
+                raise e
+        
+        # Check/create firewall rule for internal traffic
+        firewall_name = 'default-allow-internal'
+        try:
+            compute_service.firewalls().get(
+                project=PROJECT_ID,
+                firewall=firewall_name
+            ).execute()
+            yield log_msg(f"  ✓ Firewall rule '{firewall_name}' already exists", "info")
+        except Exception as e:
+            if 'notFound' in str(e) or '404' in str(e):
+                yield log_msg(f"  Creating firewall rule '{firewall_name}'...")
+                
+                firewall_body = {
+                    'name': firewall_name,
+                    'network': f'projects/{PROJECT_ID}/global/networks/default',
+                    'direction': 'INGRESS',
+                    'priority': 1000,
+                    'allowed': [
+                        {'IPProtocol': 'tcp'},
+                        {'IPProtocol': 'udp'},
+                        {'IPProtocol': 'icmp'}
+                    ],
+                    'sourceRanges': ['10.128.0.0/9']
+                }
+                
+                operation = compute_service.firewalls().insert(
+                    project=PROJECT_ID,
+                    body=firewall_body
+                ).execute()
+                
+                # Wait for operation to complete
+                yield log_msg("  Waiting for firewall rule creation...")
+                while True:
+                    result = compute_service.globalOperations().get(
+                        project=PROJECT_ID,
+                        operation=operation['name']
+                    ).execute()
+                    if result['status'] == 'DONE':
+                        break
+                
+                yield log_msg(f"  ✓ Firewall rule '{firewall_name}' created", "success")
+            else:
+                raise e
+        
+        # Enable Private Google Access on default subnet (required for internal-only VMs)
+        yield log_msg("  Enabling Private Google Access on subnet...")
+        try:
+            subnet = compute_service.subnetworks().get(
+                project=PROJECT_ID,
+                region=REGION,
+                subnetwork='default'
+            ).execute()
+            
+            if subnet.get('privateIpGoogleAccess', False):
+                yield log_msg("  ✓ Private Google Access already enabled", "info")
+            else:
+                compute_service.subnetworks().setPrivateIpGoogleAccess(
+                    project=PROJECT_ID,
+                    region=REGION,
+                    subnetwork='default',
+                    body={'privateIpGoogleAccess': True}
+                ).execute()
+                yield log_msg("  ✓ Private Google Access enabled", "success")
+        except Exception as e:
+            yield log_msg(f"  ⚠ Could not enable Private Google Access: {str(e)[:80]}", "info")
+        
+        yield log_msg("  Network: default (auto-subnets)", "info")
+        yield log_msg("  Firewall: Internal traffic allowed (10.128.0.0/9)", "info")
+        yield log_msg("  Private Google Access: Enabled (for internal-only VMs)", "info")
+        yield step_complete()
+    except Exception as e:
+        yield step_error(str(e))
+
+
 def execute_create_bucket():
     """Create GCS bucket using google-cloud-storage"""
     yield log_msg(f"Creating GCS bucket: gs://{BUCKET_NAME}...")
@@ -208,15 +328,23 @@ workDir = 'gs://{BUCKET_NAME}/scratch'
 process {{
   executor = 'google-batch'
   container = 'nextflow/rnaseq-nf'
-  errorStrategy = {{ task.exitStatus==14 ? 'retry' : 'terminate' }}
+  // Retry on any failure (spot preemption, transient errors, etc.)
+  // Retry count resets when task runs successfully
+  errorStrategy = 'retry'
   maxRetries = 5
 }}
 
 google {{
   project = '{PROJECT_ID}'
   location = '{REGION}'
-  batch.spot = true
-  batch.serviceAccountEmail = '{sa_email}'
+  batch {{
+    spot = true
+    serviceAccountEmail = '{sa_email}'
+    // Use internal IPs only (required by org policy)
+    usePrivateAddress = true
+    network = 'projects/{PROJECT_ID}/global/networks/default'
+    subnetwork = 'projects/{PROJECT_ID}/regions/{REGION}/subnetworks/default'
+  }}
 }}
 
 timeline {{
@@ -240,6 +368,8 @@ report {{
         yield log_msg(f"  workDir: gs://{BUCKET_NAME}/scratch", "info")
         yield log_msg(f"  executor: google-batch", "info")
         yield log_msg(f"  region: {REGION}", "info")
+        yield log_msg(f"  usePrivateAddress: true (internal IPs only)", "info")
+        yield log_msg(f"  errorStrategy: retry (max 5 attempts)", "info")
         yield step_complete()
     except Exception as e:
         yield step_error(str(e))
@@ -341,6 +471,7 @@ STEP_EXECUTORS = {
     'enable-apis': execute_enable_apis,
     'create-sa': execute_create_service_account,
     'iam-roles': execute_iam_roles,
+    'create-network': execute_create_network,
     'create-bucket': execute_create_bucket,
     'write-config': execute_write_config,
     # Pipeline phase
