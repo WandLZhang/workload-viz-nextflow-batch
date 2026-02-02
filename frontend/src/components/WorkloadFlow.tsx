@@ -14,6 +14,7 @@ import 'reactflow/dist/style.css';
 import { SetupStepNode } from './SetupStepNode';
 import { PipelineTaskNode } from './PipelineTaskNode';
 import { ExecutionBox } from './ExecutionBox';
+import { CostInfoTooltip } from './CostInfoTooltip';
 import './WorkloadFlow.css';
 
 const nodeTypes = {
@@ -397,6 +398,7 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
 
       <div className="workload-content">
         <div className="flow-container">
+          <CostInfoTooltip />
           <ReactFlow
             nodes={nodes}
             edges={edges}
