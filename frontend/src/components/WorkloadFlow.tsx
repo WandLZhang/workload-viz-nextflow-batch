@@ -59,13 +59,20 @@ const SETUP_STEPS = [
   { id: 'enable-apis', label: 'Enable APIs', command: 'Batch, Compute, Logging, IAM', icon: 'api' },
   { id: 'create-sa', label: 'Create Service Account', command: 'nextflow-pipeline-sa', icon: 'person' },
   { id: 'iam-roles', label: 'Add IAM Roles', command: '5 roles granted', icon: 'security' },
-  { id: 'create-network', label: 'Create VPC Network', command: 'default + firewall', icon: 'lan' },
+  { id: 'org-policies', label: 'Configure Org Policies', command: 'Shielded VM exception', icon: 'policy' },
+  { id: 'create-network', label: 'Create VPC Network', command: 'default + firewall + PGA', icon: 'lan' },
   { id: 'create-bucket', label: 'Create GCS Bucket', command: 'gs://wz-workload-viz-bucket', icon: 'cloud_upload' },
   { id: 'write-config', label: 'Write Nextflow Config', command: 'nextflow.config', icon: 'settings' },
 ];
 
+const GCP_DIFFERENTIATORS_INDEX = `🧬 Salmon Index Creation:
+• Creates reference transcriptome index for quantification
+• Runs on Google Batch with automatic VM provisioning
+• Index cached in GCS work directory for reruns`;
+
 const PIPELINE_STEPS = [
   { id: 'launch-pipeline', label: 'Launch Pipeline', command: 'nextflow run nextflow-io/rnaseq-nf', icon: 'play_arrow', tooltip: GCP_DIFFERENTIATORS['launch-pipeline'] },
+  { id: 'index', label: 'INDEX', command: 'salmon index', icon: 'inventory_2', tooltip: GCP_DIFFERENTIATORS_INDEX, batchJobUrl: 'https://console.cloud.google.com/batch/jobs?project=wz-workload-viz' },
   { id: 'fastqc', label: 'FASTQC', command: 'Quality Control', icon: 'biotech', tooltip: GCP_DIFFERENTIATORS['fastqc'], batchJobUrl: 'https://console.cloud.google.com/batch/jobs?project=wz-workload-viz' },
   { id: 'quant', label: 'QUANT', command: 'Quantification', icon: 'calculate', tooltip: GCP_DIFFERENTIATORS['quant'], batchJobUrl: 'https://console.cloud.google.com/batch/jobs?project=wz-workload-viz' },
   { id: 'multiqc', label: 'MULTIQC', command: 'Report Aggregation', icon: 'summarize', tooltip: GCP_DIFFERENTIATORS['multiqc'], batchJobUrl: 'https://console.cloud.google.com/batch/jobs?project=wz-workload-viz' },
@@ -145,13 +152,28 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
       },
     });
 
-    // Parallel tasks
-    const parallelX = PIPELINE_START_X + HORIZONTAL_GAP;
+    // INDEX and FASTQC run in parallel after launch
+    const firstParallelX = PIPELINE_START_X + HORIZONTAL_GAP;
     
+    // INDEX node (creates salmon index)
+    nodes.push({
+      id: 'index',
+      type: 'pipelineTask',
+      position: { x: firstParallelX, y: CENTER_Y - PARALLEL_Y_GAP / 2 },
+      data: {
+        label: 'INDEX', command: 'salmon index', icon: 'inventory_2',
+        status: stepStatuses['index']?.status || 'pending',
+        isSelected: selectedStep === 'index',
+        onClick: () => setSelectedStep('index'),
+        tooltip: GCP_DIFFERENTIATORS_INDEX,
+        batchJobUrl: 'https://console.cloud.google.com/batch/jobs?project=wz-workload-viz',
+      },
+    });
+
     nodes.push({
       id: 'fastqc',
       type: 'pipelineTask',
-      position: { x: parallelX, y: CENTER_Y - PARALLEL_Y_GAP },
+      position: { x: firstParallelX, y: CENTER_Y + PARALLEL_Y_GAP / 2 },
       data: {
         label: 'FASTQC', command: 'Quality Control', icon: 'biotech',
         status: stepStatuses['fastqc']?.status || 'pending',
@@ -162,10 +184,13 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
       },
     });
 
+    // QUANT depends on INDEX
+    const secondParallelX = firstParallelX + HORIZONTAL_GAP;
+    
     nodes.push({
       id: 'quant',
       type: 'pipelineTask',
-      position: { x: parallelX, y: CENTER_Y },
+      position: { x: secondParallelX, y: CENTER_Y - PARALLEL_Y_GAP / 2 },
       data: {
         label: 'QUANT', command: 'Quantification', icon: 'calculate',
         status: stepStatuses['quant']?.status || 'pending',
@@ -176,10 +201,11 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
       },
     });
 
+    // MULTIQC depends on FASTQC and QUANT
     nodes.push({
       id: 'multiqc',
       type: 'pipelineTask',
-      position: { x: parallelX, y: CENTER_Y + PARALLEL_Y_GAP },
+      position: { x: secondParallelX, y: CENTER_Y + PARALLEL_Y_GAP / 2 },
       data: {
         label: 'MULTIQC', command: 'Report Aggregation', icon: 'summarize',
         status: stepStatuses['multiqc']?.status || 'pending',
@@ -194,7 +220,7 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
     nodes.push({
       id: 'results',
       type: 'pipelineTask',
-      position: { x: parallelX + HORIZONTAL_GAP, y: CENTER_Y },
+      position: { x: secondParallelX + HORIZONTAL_GAP, y: CENTER_Y },
       data: {
         label: 'GCS Results', command: 'gs://wz-workload-viz-bucket/scratch', icon: 'cloud_done',
         status: stepStatuses['results']?.status || 'pending',
@@ -233,20 +259,52 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
       style: { stroke: stepStatuses['write-config']?.status === 'complete' ? '#4CAF50' : '#DADCE0', strokeWidth: 2 },
     });
 
-    // Launch → parallel tasks
-    ['fastqc', 'quant', 'multiqc'].forEach(taskId => {
+    // Launch → INDEX and FASTQC (run in parallel)
+    ['index', 'fastqc'].forEach(taskId => {
+      const isRunning = stepStatuses[taskId]?.status === 'running';
+      const isComplete = stepStatuses[taskId]?.status === 'complete';
       edges.push({
         id: `e-launch-${taskId}`,
         source: 'launch-pipeline', target: taskId,
         sourceHandle: 'source-right', targetHandle: 'target-left',
         type: 'smoothstep',
-        animated: stepStatuses['launch-pipeline']?.status === 'complete',
-        style: { stroke: stepStatuses['launch-pipeline']?.status === 'complete' ? '#4CAF50' : '#DADCE0', strokeWidth: 2 },
+        animated: isRunning || isComplete,
+        style: { stroke: isComplete ? '#4CAF50' : isRunning ? '#1A73E8' : '#DADCE0', strokeWidth: 2 },
       });
     });
 
-    // Parallel tasks → Results
-    ['fastqc', 'quant', 'multiqc'].forEach(taskId => {
+    // INDEX → QUANT (QUANT depends on INDEX)
+    edges.push({
+      id: 'e-index-quant',
+      source: 'index', target: 'quant',
+      sourceHandle: 'source-right', targetHandle: 'target-left',
+      type: 'smoothstep',
+      animated: stepStatuses['index']?.status === 'complete' || stepStatuses['quant']?.status === 'running',
+      style: { stroke: stepStatuses['quant']?.status === 'complete' ? '#4CAF50' : stepStatuses['index']?.status === 'complete' ? '#1A73E8' : '#DADCE0', strokeWidth: 2 },
+    });
+
+    // FASTQC → MULTIQC
+    edges.push({
+      id: 'e-fastqc-multiqc',
+      source: 'fastqc', target: 'multiqc',
+      sourceHandle: 'source-right', targetHandle: 'target-left',
+      type: 'smoothstep',
+      animated: stepStatuses['fastqc']?.status === 'complete' || stepStatuses['multiqc']?.status === 'running',
+      style: { stroke: stepStatuses['multiqc']?.status === 'complete' ? '#4CAF50' : stepStatuses['fastqc']?.status === 'complete' ? '#1A73E8' : '#DADCE0', strokeWidth: 2 },
+    });
+
+    // QUANT → MULTIQC (MULTIQC depends on both FASTQC and QUANT)
+    edges.push({
+      id: 'e-quant-multiqc',
+      source: 'quant', target: 'multiqc',
+      sourceHandle: 'source-bottom', targetHandle: 'target-top',
+      type: 'smoothstep',
+      animated: stepStatuses['quant']?.status === 'complete' || stepStatuses['multiqc']?.status === 'running',
+      style: { stroke: stepStatuses['multiqc']?.status === 'complete' ? '#4CAF50' : stepStatuses['quant']?.status === 'complete' ? '#1A73E8' : '#DADCE0', strokeWidth: 2 },
+    });
+
+    // QUANT and MULTIQC → Results
+    ['quant', 'multiqc'].forEach(taskId => {
       edges.push({
         id: `e-${taskId}-results`,
         source: taskId, target: 'results',
@@ -307,7 +365,27 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
           if (line.startsWith('data: ')) {
             try {
               const data = JSON.parse(line.substring(6));
+              
+              // Handle task-specific updates (for real-time task status during pipeline)
+              if (data.type === 'task_update' && data.task) {
+                const taskStatus = data.status as 'running' | 'complete' | 'error';
+                setStepStatuses(prev => ({
+                  ...prev,
+                  [data.task]: { 
+                    status: taskStatus, 
+                    logs: [...(prev[data.task]?.logs || []), {
+                      timestamp: new Date().toLocaleTimeString('en-US', { hour12: false }),
+                      message: data.message || `${data.task.toUpperCase()}: ${taskStatus}`,
+                      type: taskStatus === 'error' ? 'error' : taskStatus === 'complete' ? 'success' : 'info'
+                    }]
+                  }
+                }));
+              }
+              
+              // Handle regular log messages
               if (data.log) addLog(stepId, data.log, data.type || 'info');
+              
+              // Handle step completion
               if (data.status === 'complete') {
                 setStepStatuses(prev => ({ ...prev, [stepId]: { ...prev[stepId], status: 'complete' } }));
               } else if (data.status === 'error') {
