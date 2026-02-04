@@ -14,6 +14,13 @@ interface PipelineTaskNodeData {
   batchJobUrl?: string;
 }
 
+/**
+ * @brief Pipeline task node component for the workflow visualization.
+ * 
+ * @details This component renders a pipeline task (INDEX, FASTQC, QUANT, MULTIQC, Results, Workbench).
+ * It supports horizontal (left/right) and vertical (top/bottom) handles for flexible edge connections.
+ * The bottom handle is used for the Results → Workbench loop edge.
+ */
 export const PipelineTaskNode: React.FC<{ data: PipelineTaskNodeData }> = ({ data }) => {
   const getStatusClass = () => {
     switch (data.status) {
@@ -45,8 +52,11 @@ export const PipelineTaskNode: React.FC<{ data: PipelineTaskNodeData }> = ({ dat
       className={`step-node pipeline-node ${getStatusClass()} ${data.isSelected ? 'node-selected' : ''}`}
       onClick={data.onClick}
     >
-      {/* Horizontal handles for pipeline phase: left (input) and right (output) */}
+      {/* All handles for flexible edge connections */}
       <Handle type="target" position={Position.Left} id="target-left" />
+      <Handle type="target" position={Position.Top} id="target-top" />
+      <Handle type="target" position={Position.Bottom} id="target-bottom" />
+      <Handle type="target" position={Position.Right} id="target-right" />
       
       <div className="node-content">
         <div className="node-icon-container pipeline-icon-container">
@@ -80,6 +90,8 @@ export const PipelineTaskNode: React.FC<{ data: PipelineTaskNodeData }> = ({ dat
       </div>
 
       <Handle type="source" position={Position.Right} id="source-right" />
+      <Handle type="source" position={Position.Bottom} id="source-bottom" />
+      <Handle type="source" position={Position.Top} id="source-top" />
     </div>
   );
 };

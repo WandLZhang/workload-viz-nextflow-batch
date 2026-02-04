@@ -53,6 +53,7 @@ export const SetupStepNode: React.FC<{ data: SetupStepNodeData }> = ({ data }) =
 
       <Handle type="source" position={Position.Bottom} id="source-bottom" />
       <Handle type="source" position={Position.Right} id="source-right" />
+      <Handle type="source" position={Position.Left} id="source-left" />
     </div>
   );
 };

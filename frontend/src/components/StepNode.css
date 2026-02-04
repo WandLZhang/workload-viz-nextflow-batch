@@ -18,6 +18,13 @@
   max-width: 300px;
 }
 
+/* Pipeline nodes: fixed width to ensure perfect alignment for all pipeline nodes (Provision Workbench onwards) */
+.step-node.pipeline-node {
+  width: 400px;
+  min-width: 400px;
+  max-width: 400px;
+}
+
 .step-node:hover {
   box-shadow: var(--elevation-2);
   transform: translateY(-2px);

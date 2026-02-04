@@ -2,13 +2,20 @@
 @file main.py
 @brief Flask backend for Nextflow Workload Visualizer using Python GCP libraries
 
+@details This backend provides real GCP infrastructure provisioning including:
+- VPC network and firewall configuration
+- Vertex AI Workbench provisioning for researcher environments
+- Google Batch job status polling for pipeline monitoring
+- GCS bucket management for pipeline I/O
+
 @author Willis Zhang
 @date 2026-01-30
 """
 
 import json
 import os
-from flask import Flask, request, Response, stream_with_context
+import time
+from flask import Flask, request, Response, stream_with_context, jsonify
 from flask_cors import CORS
 
 # GCP Libraries
@@ -26,6 +33,8 @@ PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "wz-workload-viz")
 BUCKET_NAME = f"{PROJECT_ID}-bucket"
 SERVICE_ACCOUNT_NAME = os.environ.get("SERVICE_ACCOUNT_NAME", "nextflow-pipeline-sa")
 REGION = os.environ.get("GCP_REGION", "us-central1")
+ZONE = f"{REGION}-a"
+WORKBENCH_INSTANCE_NAME = os.environ.get("WORKBENCH_INSTANCE_NAME", "nextflow-researcher-workbench")
 
 
 def stream_sse(data: dict) -> str:
@@ -367,6 +376,292 @@ def execute_create_network():
         yield step_error(str(e))
 
 
+def execute_provision_workbench():
+    """
+    Provision a Vertex AI Workbench instance for researchers.
+    Uses the Notebooks API (notebooks.googleapis.com) to create a managed notebook instance.
+    If instance already exists, returns the URL to access it.
+    """
+    yield log_msg(f"Provisioning Vertex AI Workbench: {WORKBENCH_INSTANCE_NAME}...")
+    
+    try:
+        credentials, project = default()
+        
+        # First, enable the Notebooks API if not already enabled
+        yield log_msg("  Enabling notebooks.googleapis.com API...")
+        try:
+            service_usage = discovery.build('serviceusage', 'v1', credentials=credentials)
+            service_usage.services().enable(
+                name=f'projects/{PROJECT_ID}/services/notebooks.googleapis.com'
+            ).execute()
+            yield log_msg("  ✓ Notebooks API enabled", "success")
+        except Exception as e:
+            if "already enabled" in str(e).lower():
+                yield log_msg("  ✓ Notebooks API already enabled", "info")
+            else:
+                yield log_msg(f"  ⚠ Notebooks API: {str(e)[:80]}", "info")
+        
+        # Build the Notebooks API client
+        notebooks_service = discovery.build('notebooks', 'v1', credentials=credentials)
+        
+        instance_name = f"projects/{PROJECT_ID}/locations/{ZONE}/instances/{WORKBENCH_INSTANCE_NAME}"
+        workbench_url = f"https://console.cloud.google.com/vertex-ai/workbench/instances?project={PROJECT_ID}"
+        jupyter_url = None
+        
+        # Check if instance already exists
+        try:
+            yield log_msg(f"  Checking for existing instance...")
+            instance = notebooks_service.projects().locations().instances().get(
+                name=instance_name
+            ).execute()
+            
+            state = instance.get('state', 'UNKNOWN')
+            yield log_msg(f"  ✓ Workbench instance already exists (state: {state})", "info")
+            
+            # Get the proxy URI for JupyterLab access
+            if 'proxyUri' in instance:
+                jupyter_url = instance['proxyUri']
+                yield log_msg(f"  JupyterLab URL: {jupyter_url}", "success")
+            
+            # Send the workbench URL for frontend to display
+            yield stream_sse({
+                "log": f"Workbench ready: {WORKBENCH_INSTANCE_NAME}",
+                "type": "success",
+                "workbenchUrl": workbench_url,
+                "jupyterUrl": jupyter_url,
+                "instanceName": WORKBENCH_INSTANCE_NAME,
+                "status": "complete"
+            })
+            return
+            
+        except Exception as e:
+            if 'notFound' not in str(e).lower() and '404' not in str(e):
+                raise e
+            yield log_msg(f"  Instance not found, creating new workbench...", "info")
+        
+        # Create the Workbench instance
+        sa_email = f"{SERVICE_ACCOUNT_NAME}@{PROJECT_ID}.iam.gserviceaccount.com"
+        
+        # Startup script to install Nextflow and configure the environment
+        startup_script = f'''#!/bin/bash
+# Install Java (required for Nextflow)
+apt-get update && apt-get install -y default-jdk
+
+# Install Nextflow
+curl -s https://get.nextflow.io | bash
+mv nextflow /usr/local/bin/
+
+# Create researcher workspace
+mkdir -p /home/jupyter/nextflow-workspace
+cd /home/jupyter/nextflow-workspace
+
+# Create a sample nextflow.config
+cat > nextflow.config << 'EOF'
+workDir = 'gs://{BUCKET_NAME}/scratch'
+
+process {{
+  executor = 'google-batch'
+  container = 'nextflow/rnaseq-nf'
+  errorStrategy = 'retry'
+  maxRetries = 5
+  machineType = 'n1-standard-1'
+  disk = '30 GB'
+}}
+
+google {{
+  project = '{PROJECT_ID}'
+  location = '{REGION}'
+  batch {{
+    spot = true
+    serviceAccountEmail = '{sa_email}'
+    usePrivateAddress = true
+    network = 'projects/{PROJECT_ID}/global/networks/default'
+    subnetwork = 'projects/{PROJECT_ID}/regions/{REGION}/subnetworks/default'
+  }}
+}}
+EOF
+
+# Create a getting started notebook
+cat > /home/jupyter/nextflow-workspace/Getting_Started_RNAseq.ipynb << 'NOTEBOOK'
+{{
+  "cells": [
+    {{
+      "cell_type": "markdown",
+      "metadata": {{}},
+      "source": ["# 🧬 Getting Started with Nextflow on Google Cloud Batch\\n", "\\n", "This notebook walks you through running an RNAseq pipeline using Nextflow on Google Cloud Batch."]
+    }},
+    {{
+      "cell_type": "markdown",
+      "metadata": {{}},
+      "source": ["## Step 1: Verify Environment"]
+    }},
+    {{
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {{}},
+      "outputs": [],
+      "source": ["!nextflow -version\\n", "!gcloud config get-value project"]
+    }},
+    {{
+      "cell_type": "markdown",
+      "metadata": {{}},
+      "source": ["## Step 2: Create GCS Bucket for Pipeline I/O"]
+    }},
+    {{
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {{}},
+      "outputs": [],
+      "source": ["BUCKET_NAME = '{BUCKET_NAME}'\\n", "!gcloud storage buckets describe gs://$BUCKET_NAME || gcloud storage buckets create gs://$BUCKET_NAME --location={REGION}"]
+    }},
+    {{
+      "cell_type": "markdown",
+      "metadata": {{}},
+      "source": ["## Step 3: Launch RNAseq Pipeline"]
+    }},
+    {{
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {{}},
+      "outputs": [],
+      "source": ["%%bash\\n", "cd /home/jupyter/nextflow-workspace\\n", "nextflow run nextflow-io/rnaseq-nf -c nextflow.config"]
+    }},
+    {{
+      "cell_type": "markdown",
+      "metadata": {{}},
+      "source": ["## Step 4: Monitor Batch Jobs"]
+    }},
+    {{
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {{}},
+      "outputs": [],
+      "source": ["!gcloud batch jobs list --location={REGION} --filter='name~nf-' --format='table(name.basename(),status.state,createTime)'"]
+    }},
+    {{
+      "cell_type": "markdown",
+      "metadata": {{}},
+      "source": ["## Step 5: View Results"]
+    }},
+    {{
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {{}},
+      "outputs": [],
+      "source": ["!gcloud storage ls gs://{BUCKET_NAME}/scratch/"]
+    }},
+    {{
+      "cell_type": "markdown",
+      "metadata": {{}},
+      "source": ["## Step 6: Analyze Results\\n", "\\n", "Load and analyze the quantification results."]
+    }},
+    {{
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {{}},
+      "outputs": [],
+      "source": ["import pandas as pd\\n", "# Download results locally\\n", "!gcloud storage cp -r gs://{BUCKET_NAME}/scratch/results/ ./results/\\n", "# View MultiQC report (open in browser)\\n", "print('View MultiQC report: results/multiqc_report.html')"]
+    }}
+  ],
+  "metadata": {{
+    "kernelspec": {{
+      "display_name": "Python 3",
+      "language": "python",
+      "name": "python3"
+    }}
+  }},
+  "nbformat": 4,
+  "nbformat_minor": 4
+}}
+NOTEBOOK
+
+chown -R jupyter:jupyter /home/jupyter/nextflow-workspace
+'''
+
+        instance_body = {
+            'vmImage': {
+                'project': 'deeplearning-platform-release',
+                'imageFamily': 'common-cpu-notebooks'
+            },
+            'machineType': 'n1-standard-4',
+            'serviceAccount': sa_email,
+            'network': f'projects/{PROJECT_ID}/global/networks/default',
+            'subnet': f'projects/{PROJECT_ID}/regions/{REGION}/subnetworks/default',
+            'noPublicIp': True,  # Use internal IP only (org policy compliance)
+            'metadata': {
+                'startup-script': startup_script,
+                'proxy-mode': 'service_account'
+            },
+            'postStartupScript': startup_script
+        }
+        
+        yield log_msg("  Creating Workbench instance (this takes 3-5 minutes)...", "info")
+        yield log_msg(f"  Machine: n1-standard-4, Zone: {ZONE}", "info")
+        yield log_msg(f"  Network: default (no public IP)", "info")
+        
+        operation = notebooks_service.projects().locations().instances().create(
+            parent=f"projects/{PROJECT_ID}/locations/{ZONE}",
+            instanceId=WORKBENCH_INSTANCE_NAME,
+            body=instance_body
+        ).execute()
+        
+        operation_name = operation.get('name')
+        yield log_msg(f"  Operation started: {operation_name.split('/')[-1]}", "info")
+        
+        # Poll for operation completion
+        max_wait = 600  # 10 minutes max
+        poll_interval = 15
+        elapsed = 0
+        
+        while elapsed < max_wait:
+            op_result = notebooks_service.projects().locations().operations().get(
+                name=operation_name
+            ).execute()
+            
+            if op_result.get('done'):
+                if 'error' in op_result:
+                    yield step_error(f"Failed: {op_result['error'].get('message', 'Unknown error')}")
+                    return
+                
+                yield log_msg("  ✓ Workbench instance created successfully!", "success")
+                
+                # Get the instance details
+                instance = notebooks_service.projects().locations().instances().get(
+                    name=instance_name
+                ).execute()
+                
+                if 'proxyUri' in instance:
+                    jupyter_url = instance['proxyUri']
+                    yield log_msg(f"  JupyterLab URL: {jupyter_url}", "success")
+                
+                yield stream_sse({
+                    "log": f"Workbench ready: {WORKBENCH_INSTANCE_NAME}",
+                    "type": "success",
+                    "workbenchUrl": workbench_url,
+                    "jupyterUrl": jupyter_url,
+                    "instanceName": WORKBENCH_INSTANCE_NAME,
+                    "status": "complete"
+                })
+                return
+            
+            elapsed += poll_interval
+            yield log_msg(f"  Provisioning... ({elapsed}s elapsed)", "info")
+            time.sleep(poll_interval)
+        
+        yield log_msg("  ⚠ Workbench still provisioning (check console)", "info")
+        yield stream_sse({
+            "log": f"Workbench provisioning in progress",
+            "type": "info",
+            "workbenchUrl": workbench_url,
+            "instanceName": WORKBENCH_INSTANCE_NAME,
+            "status": "complete"
+        })
+        
+    except Exception as e:
+        print(f"[ERROR] Workbench provisioning failed: {str(e)}")
+        yield step_error(str(e))
+
+
 def execute_create_bucket():
     """Create GCS bucket using google-cloud-storage"""
     yield log_msg(f"Creating GCS bucket: gs://{BUCKET_NAME}...")
@@ -614,20 +909,23 @@ def execute_list_results():
 
 # Map step IDs to executor functions
 STEP_EXECUTORS = {
-    # Setup phase
+    # Infrastructure setup phase (platform team)
     'enable-apis': execute_enable_apis,
     'create-sa': execute_create_service_account,
     'iam-roles': execute_iam_roles,
     'org-policies': execute_configure_org_policies,
     'create-network': execute_create_network,
-    'create-bucket': execute_create_bucket,
+    # Researcher environment provisioning
+    'provision-workbench': execute_provision_workbench,
+    # Researcher workflow (triggered from notebook cells, but we visualize)
+    'storage-bucket': execute_create_bucket,
     'write-config': execute_write_config,
-    # Pipeline phase
+    # Pipeline execution
     'launch-pipeline': execute_launch_pipeline,
+    'index': execute_check_jobs,
     'fastqc': execute_check_jobs,
     'quant': execute_check_jobs,
     'multiqc': execute_check_jobs,
-    'results': execute_list_results,
 }
 
 
@@ -663,6 +961,179 @@ def execute_step():
 def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "project": PROJECT_ID}
+
+
+@app.route('/api/poll-jobs', methods=['GET'])
+def poll_jobs():
+    """
+    Poll Google Batch for job status - returns current status of all nf-* jobs.
+    Used by frontend to animate pipeline progress in real-time.
+    
+    Returns JSON with job statuses mapped to task IDs (index, fastqc, quant, multiqc).
+    """
+    print(f"\n[POLL] Polling Batch jobs...")
+    
+    try:
+        credentials, project = default()
+        service = discovery.build('batch', 'v1', credentials=credentials)
+        
+        parent = f"projects/{PROJECT_ID}/locations/{REGION}"
+        request = service.projects().locations().jobs().list(parent=parent)
+        response = request.execute()
+        
+        jobs = response.get('jobs', [])
+        
+        # Filter to only nf-* jobs (Nextflow jobs)
+        nf_jobs = [j for j in jobs if j.get('name', '').split('/')[-1].startswith('nf-')]
+        
+        # Sort by creation time (newest first)
+        nf_jobs.sort(key=lambda j: j.get('createTime', ''), reverse=True)
+        
+        # Build response with job details
+        job_list = []
+        task_statuses = {
+            'index': 'pending',
+            'fastqc': 'pending', 
+            'quant': 'pending',
+            'multiqc': 'pending',
+            'results': 'pending'
+        }
+        
+        # Map job names to tasks based on Nextflow naming patterns
+        # Nextflow creates jobs like: nf-RNASEQ_INDEX-xxxxx, nf-RNASEQ_FASTQC-xxxxx, etc.
+        for job in nf_jobs[:20]:  # Look at recent 20 jobs
+            job_name = job.get('name', '').split('/')[-1]
+            state = job.get('status', {}).get('state', 'UNKNOWN')
+            create_time = job.get('createTime', '')
+            
+            # Calculate runtime if available
+            runtime_seconds = None
+            status_events = job.get('status', {}).get('statusEvents', [])
+            if status_events:
+                # Find start and end times
+                start_time = None
+                end_time = None
+                for event in status_events:
+                    event_time = event.get('eventTime', '')
+                    if 'RUNNING' in event.get('description', '').upper():
+                        start_time = event_time
+                    if state in ['SUCCEEDED', 'FAILED']:
+                        end_time = event_time
+                
+                if start_time and end_time:
+                    from datetime import datetime
+                    try:
+                        start = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                        end = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
+                        runtime_seconds = int((end - start).total_seconds())
+                    except:
+                        pass
+            
+            job_info = {
+                'name': job_name,
+                'state': state,
+                'createTime': create_time,
+                'runtimeSeconds': runtime_seconds
+            }
+            job_list.append(job_info)
+            
+            # Map to task IDs
+            job_name_upper = job_name.upper()
+            if 'INDEX' in job_name_upper:
+                task_statuses['index'] = 'complete' if state == 'SUCCEEDED' else ('running' if state == 'RUNNING' else 'pending')
+            elif 'FASTQC' in job_name_upper:
+                task_statuses['fastqc'] = 'complete' if state == 'SUCCEEDED' else ('running' if state == 'RUNNING' else 'pending')
+            elif 'QUANT' in job_name_upper:
+                task_statuses['quant'] = 'complete' if state == 'SUCCEEDED' else ('running' if state == 'RUNNING' else 'pending')
+            elif 'MULTIQC' in job_name_upper:
+                task_statuses['multiqc'] = 'complete' if state == 'SUCCEEDED' else ('running' if state == 'RUNNING' else 'pending')
+        
+        # Check if all pipeline tasks are complete → results are ready
+        pipeline_tasks = ['index', 'fastqc', 'quant', 'multiqc']
+        all_complete = all(task_statuses[t] == 'complete' for t in pipeline_tasks)
+        if all_complete:
+            task_statuses['results'] = 'complete'
+        elif any(task_statuses[t] in ['running', 'complete'] for t in pipeline_tasks):
+            task_statuses['results'] = 'running'
+        
+        response_data = {
+            'jobs': job_list,
+            'taskStatuses': task_statuses,
+            'totalJobs': len(nf_jobs),
+            'pipelineComplete': all_complete
+        }
+        
+        print(f"[POLL] Found {len(nf_jobs)} Nextflow jobs, task statuses: {task_statuses}")
+        return jsonify(response_data)
+        
+    except Exception as e:
+        print(f"[POLL ERROR] {str(e)}")
+        return jsonify({
+            'error': str(e),
+            'jobs': [],
+            'taskStatuses': {
+                'index': 'pending',
+                'fastqc': 'pending',
+                'quant': 'pending',
+                'multiqc': 'pending',
+                'results': 'pending'
+            }
+        }), 500
+
+
+@app.route('/api/workbench-status', methods=['GET'])
+def get_workbench_status():
+    """
+    Get the current status and URL of the Vertex AI Workbench instance.
+    Used by frontend to display link to workbench and check if it's ready.
+    """
+    print(f"\n[WORKBENCH] Checking workbench status...")
+    
+    try:
+        credentials, project = default()
+        notebooks_service = discovery.build('notebooks', 'v1', credentials=credentials)
+        
+        instance_name = f"projects/{PROJECT_ID}/locations/{ZONE}/instances/{WORKBENCH_INSTANCE_NAME}"
+        
+        try:
+            instance = notebooks_service.projects().locations().instances().get(
+                name=instance_name
+            ).execute()
+            
+            state = instance.get('state', 'UNKNOWN')
+            proxy_uri = instance.get('proxyUri', None)
+            
+            workbench_url = f"https://console.cloud.google.com/vertex-ai/workbench/instances?project={PROJECT_ID}"
+            
+            response_data = {
+                'exists': True,
+                'state': state,
+                'instanceName': WORKBENCH_INSTANCE_NAME,
+                'workbenchUrl': workbench_url,
+                'jupyterUrl': proxy_uri,
+                'ready': state == 'ACTIVE'
+            }
+            
+            print(f"[WORKBENCH] Instance state: {state}, ready: {state == 'ACTIVE'}")
+            return jsonify(response_data)
+            
+        except Exception as e:
+            if 'notFound' in str(e).lower() or '404' in str(e):
+                return jsonify({
+                    'exists': False,
+                    'state': 'NOT_FOUND',
+                    'instanceName': WORKBENCH_INSTANCE_NAME,
+                    'ready': False
+                })
+            raise e
+            
+    except Exception as e:
+        print(f"[WORKBENCH ERROR] {str(e)}")
+        return jsonify({
+            'error': str(e),
+            'exists': False,
+            'ready': False
+        }), 500
 
 
 if __name__ == '__main__':

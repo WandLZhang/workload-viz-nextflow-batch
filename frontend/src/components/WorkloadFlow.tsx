@@ -13,6 +13,7 @@ import ReactFlow, {
 import 'reactflow/dist/style.css';
 import { SetupStepNode } from './SetupStepNode';
 import { PipelineTaskNode } from './PipelineTaskNode';
+import { GroupNode } from './GroupNode';
 import { ExecutionBox } from './ExecutionBox';
 import { CostInfoTooltip } from './CostInfoTooltip';
 import './WorkloadFlow.css';
@@ -20,6 +21,7 @@ import './WorkloadFlow.css';
 const nodeTypes = {
   setupStep: SetupStepNode,
   pipelineTask: PipelineTaskNode,
+  groupNode: GroupNode,
 };
 
 const GCP_DIFFERENTIATORS = {
@@ -53,31 +55,38 @@ const GCP_DIFFERENTIATORS = {
 • Single bucket namespace spanning two regions
 • Strong consistency with RTO of zero
 • Other clouds require managing separate buckets with eventual consistency`,
+  'provision-workbench': `🔬 Vertex AI Workbench:
+• Fully managed JupyterLab environment for researchers
+• Pre-configured with Nextflow, gcloud CLI, and Python
+• Secure access via IAP - no public IP required
+• Integrated with GCS for seamless data access
+• Cost: ~$0.19/hr for n1-standard-4`,
+  'storage-bucket': `📦 Storage Bucket:
+• Time to first byte fastest among all storage classes
+• Google's private network retrieves data immediately from all classes
+• Data encrypted by default with configurable dual-region
+• Customer-managed encryption keys available
+
+🌐 Dual-Region Storage:
+• Single bucket namespace spanning two regions
+• Strong consistency with RTO of zero
+• Other clouds require managing separate buckets with eventual consistency`,
 };
 
-const SETUP_STEPS = [
+// Infrastructure setup steps (platform team) - vertical column on left
+const INFRA_STEPS = [
   { id: 'enable-apis', label: 'Enable APIs', command: 'Batch, Compute, Logging, IAM', icon: 'api' },
   { id: 'create-sa', label: 'Create Service Account', command: 'nextflow-pipeline-sa', icon: 'person' },
   { id: 'iam-roles', label: 'Add IAM Roles', command: '5 roles granted', icon: 'security' },
   { id: 'org-policies', label: 'Configure Org Policies', command: 'VM + Image exceptions', icon: 'policy' },
   { id: 'create-network', label: 'Create VPC Network', command: 'default + firewall + PGA', icon: 'lan' },
-  { id: 'create-bucket', label: 'Create GCS Bucket', command: 'gs://wz-workload-viz-bucket', icon: 'cloud_upload' },
-  { id: 'write-config', label: 'Write Nextflow Config', command: 'nextflow.config', icon: 'settings' },
 ];
 
 const GCP_DIFFERENTIATORS_INDEX = `🧬 Salmon Index Creation:
 • Creates reference transcriptome index for quantification
 • Runs on Google Batch with automatic VM provisioning
-• Index cached in GCS work directory for reruns`;
-
-const PIPELINE_STEPS = [
-  { id: 'launch-pipeline', label: 'Launch Pipeline', command: 'nextflow run nextflow-io/rnaseq-nf', icon: 'play_arrow', tooltip: GCP_DIFFERENTIATORS['launch-pipeline'] },
-  { id: 'index', label: 'INDEX', command: 'salmon index', icon: 'inventory_2', tooltip: GCP_DIFFERENTIATORS_INDEX, batchJobUrl: 'https://console.cloud.google.com/batch/jobs?project=wz-workload-viz' },
-  { id: 'fastqc', label: 'FASTQC', command: 'Quality Control', icon: 'biotech', tooltip: GCP_DIFFERENTIATORS['fastqc'], batchJobUrl: 'https://console.cloud.google.com/batch/jobs?project=wz-workload-viz' },
-  { id: 'quant', label: 'QUANT', command: 'Quantification', icon: 'calculate', tooltip: GCP_DIFFERENTIATORS['quant'], batchJobUrl: 'https://console.cloud.google.com/batch/jobs?project=wz-workload-viz' },
-  { id: 'multiqc', label: 'MULTIQC', command: 'Report Aggregation', icon: 'summarize', tooltip: GCP_DIFFERENTIATORS['multiqc'], batchJobUrl: 'https://console.cloud.google.com/batch/jobs?project=wz-workload-viz' },
-  { id: 'results', label: 'GCS Results', command: 'gs://wz-workload-viz-bucket/scratch', icon: 'cloud_done', tooltip: GCP_DIFFERENTIATORS['results'], batchJobUrl: 'https://console.cloud.google.com/storage/browser/wz-workload-viz-bucket?project=wz-workload-viz' },
-];
+• Index cached in GCS work directory for reruns
+• Runtime: ~9 minutes on n1-standard-1`;
 
 interface StepStatus {
   status: 'pending' | 'running' | 'complete' | 'error';
@@ -88,43 +97,106 @@ interface WorkloadFlowInnerProps {
   onComplete?: () => void;
 }
 
-// Inner component that uses useReactFlow
 const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => {
   const [stepStatuses, setStepStatuses] = useState<Record<string, StepStatus>>({});
   const [isRunning, setIsRunning] = useState(false);
   const [selectedStep, setSelectedStep] = useState<string | null>(null);
   const [currentPhase, setCurrentPhase] = useState<'setup' | 'pipeline'>('setup');
+  const [workbenchUrl, setWorkbenchUrl] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
-  const { setViewport, fitView } = useReactFlow();
+  const { setViewport } = useReactFlow();
 
-  // Layout constants - increased horizontal spacing
-  const SETUP_START_X = 50;
-  const SETUP_START_Y = 30;
-  const SETUP_Y_GAP = 90;
-  const CENTER_Y = 220;
-  const PIPELINE_START_X = 500;
-  const HORIZONTAL_GAP = 420; // More spacing
-  const PARALLEL_Y_GAP = 130;
+  // Layout constants
+  const INFRA_START_X = 50;
+  const INFRA_START_Y = 30;
+  const INFRA_Y_GAP = 90;
+  
+  // IAM Roles Y position (index 2) - Launch Pipeline aligns with this
+  const IAM_ROLES_Y = INFRA_START_Y + 2 * INFRA_Y_GAP;  // = 210
+  
+  // Workbench: below VPC Network, left-aligned with infra column
+  const WORKBENCH_X = INFRA_START_X;
+  const WORKBENCH_Y = INFRA_START_Y + INFRA_STEPS.length * INFRA_Y_GAP + 80;
+  
+  // Storage Bucket: directly to the right of workbench, same Y level
+  const BUCKET_X = WORKBENCH_X + 450;  // Gap for 400px nodes
+  const BUCKET_Y = WORKBENCH_Y;
+  
+  // Launch Pipeline: aligned vertically with IAM Roles, same X as bucket
+  const LAUNCH_X = BUCKET_X;
+  const LAUNCH_Y = IAM_ROLES_Y;  // Center vertically with IAM Roles
+  
+  // Pipeline tasks flow to the right with spacing for 400px nodes
+  const HORIZONTAL_GAP = 450;  // Gap for 400px nodes
+  const PARALLEL_Y_GAP = 140;  // Vertical spacing between parallel tasks
 
-  // Zoom to setup nodes
   const zoomToSetup = useCallback(() => {
     setViewport({ x: 100, y: 0, zoom: 1.2 }, { duration: 800 });
   }, [setViewport]);
 
-  // Zoom to pipeline nodes
   const zoomToPipeline = useCallback(() => {
-    setViewport({ x: -350, y: 0, zoom: 0.9 }, { duration: 800 });
+    setViewport({ x: -100, y: 50, zoom: 0.7 }, { duration: 800 });
   }, [setViewport]);
 
   const generateNodes = useCallback((): Node[] => {
     const nodes: Node[] = [];
+    
+    // Calculate group box dimensions
+    const secondParallelX = LAUNCH_X + HORIZONTAL_GAP * 2;
+    const nodeHeight = 80;
+    const padding = 30;
+    const leftPadding = 80;  // Extra left padding for edge clearance and labels
+    
+    // IT Group Box: contains infra steps + launch pipeline + pipeline tasks
+    const itBoxX = INFRA_START_X - leftPadding;
+    const itBoxY = INFRA_START_Y - padding - 20;  // Extra top for label
+    const itBoxWidth = secondParallelX + 400 + padding - itBoxX + 40;  // extends to rightmost task + padding
+    const itBoxHeight = WORKBENCH_Y - itBoxY - 50;  // ends clearly above workbench row
+    
+    nodes.push({
+      id: 'group-it',
+      type: 'groupNode',
+      position: { x: itBoxX, y: itBoxY },
+      zIndex: -1,
+      selectable: false,
+      draggable: false,
+      data: {
+        label: 'IT',
+        icon: 'admin_panel_settings',
+        width: itBoxWidth,
+        height: itBoxHeight,
+        groupType: 'it',
+      },
+    });
+    
+    // Researcher Group Box: contains workbench + storage bucket
+    const researcherBoxX = WORKBENCH_X - leftPadding;
+    const researcherBoxY = WORKBENCH_Y - padding - 20;  // Extra top for label
+    const researcherBoxWidth = BUCKET_X + 400 + padding - researcherBoxX + 40;
+    const researcherBoxHeight = nodeHeight + padding * 2 + 20;
+    
+    nodes.push({
+      id: 'group-researcher',
+      type: 'groupNode',
+      position: { x: researcherBoxX, y: researcherBoxY },
+      zIndex: -1,
+      selectable: false,
+      draggable: false,
+      data: {
+        label: 'Researcher',
+        icon: 'science',
+        width: researcherBoxWidth,
+        height: researcherBoxHeight,
+        groupType: 'researcher',
+      },
+    });
 
-    // Setup nodes
-    SETUP_STEPS.forEach((step, index) => {
+    // Infrastructure setup nodes (vertical stack on left)
+    INFRA_STEPS.forEach((step, index) => {
       nodes.push({
         id: step.id,
         type: 'setupStep',
-        position: { x: SETUP_START_X, y: SETUP_START_Y + index * SETUP_Y_GAP },
+        position: { x: INFRA_START_X, y: INFRA_START_Y + index * INFRA_Y_GAP },
         data: {
           label: step.label,
           command: step.command,
@@ -136,11 +208,46 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
       });
     });
 
-    // Launch Pipeline
+    // Provision Workbench: below VPC, slightly right
+    const defaultWorkbenchUrl = 'https://console.cloud.google.com/vertex-ai/workbench/instances?project=wz-workload-viz';
+    nodes.push({
+      id: 'provision-workbench',
+      type: 'pipelineTask',
+      position: { x: WORKBENCH_X, y: WORKBENCH_Y },
+      data: {
+        label: 'Provision Workbench',
+        command: 'Vertex AI Workbench',
+        icon: 'terminal',
+        status: stepStatuses['provision-workbench']?.status || 'pending',
+        isSelected: selectedStep === 'provision-workbench',
+        onClick: () => setSelectedStep('provision-workbench'),
+        tooltip: GCP_DIFFERENTIATORS['provision-workbench'],
+        batchJobUrl: workbenchUrl || defaultWorkbenchUrl,
+      },
+    });
+
+    // Storage Bucket: input/output for pipeline
+    nodes.push({
+      id: 'storage-bucket',
+      type: 'pipelineTask',
+      position: { x: BUCKET_X, y: BUCKET_Y },
+      data: {
+        label: 'Storage Bucket',
+        command: 'gs://wz-workload-viz-bucket',
+        icon: 'cloud_upload',
+        status: stepStatuses['storage-bucket']?.status || 'pending',
+        isSelected: selectedStep === 'storage-bucket',
+        onClick: () => setSelectedStep('storage-bucket'),
+        tooltip: GCP_DIFFERENTIATORS['storage-bucket'],
+        batchJobUrl: 'https://console.cloud.google.com/storage/browser/wz-workload-viz-bucket?project=wz-workload-viz',
+      },
+    });
+
+    // Launch Pipeline: centered above bucket (vertical line)
     nodes.push({
       id: 'launch-pipeline',
       type: 'pipelineTask',
-      position: { x: PIPELINE_START_X, y: CENTER_Y },
+      position: { x: LAUNCH_X, y: LAUNCH_Y },
       data: {
         label: 'Launch Pipeline',
         command: 'nextflow run nextflow-io/rnaseq-nf',
@@ -153,15 +260,14 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
     });
 
     // INDEX and FASTQC run in parallel after launch
-    const firstParallelX = PIPELINE_START_X + HORIZONTAL_GAP;
+    const firstParallelX = LAUNCH_X + HORIZONTAL_GAP;
     
-    // INDEX node (creates salmon index)
     nodes.push({
       id: 'index',
       type: 'pipelineTask',
-      position: { x: firstParallelX, y: CENTER_Y - PARALLEL_Y_GAP / 2 },
+      position: { x: firstParallelX, y: LAUNCH_Y - PARALLEL_Y_GAP / 2 - 30 },
       data: {
-        label: 'INDEX', command: 'salmon index', icon: 'inventory_2',
+        label: 'INDEX', command: 'salmon index (~9 min)', icon: 'inventory_2',
         status: stepStatuses['index']?.status || 'pending',
         isSelected: selectedStep === 'index',
         onClick: () => setSelectedStep('index'),
@@ -173,9 +279,9 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
     nodes.push({
       id: 'fastqc',
       type: 'pipelineTask',
-      position: { x: firstParallelX, y: CENTER_Y + PARALLEL_Y_GAP / 2 },
+      position: { x: firstParallelX, y: LAUNCH_Y + PARALLEL_Y_GAP / 2 + 30 },
       data: {
-        label: 'FASTQC', command: 'Quality Control', icon: 'biotech',
+        label: 'FASTQC', command: 'Quality Control (~11s)', icon: 'biotech',
         status: stepStatuses['fastqc']?.status || 'pending',
         isSelected: selectedStep === 'fastqc',
         onClick: () => setSelectedStep('fastqc'),
@@ -184,15 +290,14 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
       },
     });
 
-    // QUANT depends on INDEX
-    const secondParallelX = firstParallelX + HORIZONTAL_GAP;
+    // QUANT and MULTIQC (using secondParallelX already defined above)
     
     nodes.push({
       id: 'quant',
       type: 'pipelineTask',
-      position: { x: secondParallelX, y: CENTER_Y - PARALLEL_Y_GAP / 2 },
+      position: { x: secondParallelX, y: LAUNCH_Y - PARALLEL_Y_GAP / 2 - 30 },
       data: {
-        label: 'QUANT', command: 'Quantification', icon: 'calculate',
+        label: 'QUANT', command: 'Quantification (~9 min)', icon: 'calculate',
         status: stepStatuses['quant']?.status || 'pending',
         isSelected: selectedStep === 'quant',
         onClick: () => setSelectedStep('quant'),
@@ -201,13 +306,12 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
       },
     });
 
-    // MULTIQC depends on FASTQC and QUANT
     nodes.push({
       id: 'multiqc',
       type: 'pipelineTask',
-      position: { x: secondParallelX, y: CENTER_Y + PARALLEL_Y_GAP / 2 },
+      position: { x: secondParallelX, y: LAUNCH_Y + PARALLEL_Y_GAP / 2 + 30 },
       data: {
-        label: 'MULTIQC', command: 'Report Aggregation', icon: 'summarize',
+        label: 'MULTIQC', command: 'Report Aggregation (~13s)', icon: 'summarize',
         status: stepStatuses['multiqc']?.status || 'pending',
         isSelected: selectedStep === 'multiqc',
         onClick: () => setSelectedStep('multiqc'),
@@ -216,32 +320,17 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
       },
     });
 
-    // Results
-    nodes.push({
-      id: 'results',
-      type: 'pipelineTask',
-      position: { x: secondParallelX + HORIZONTAL_GAP, y: CENTER_Y },
-      data: {
-        label: 'GCS Results', command: 'gs://wz-workload-viz-bucket/scratch', icon: 'cloud_done',
-        status: stepStatuses['results']?.status || 'pending',
-        isSelected: selectedStep === 'results',
-        onClick: () => setSelectedStep('results'),
-        tooltip: GCP_DIFFERENTIATORS['results'],
-        batchJobUrl: 'https://console.cloud.google.com/storage/browser/wz-workload-viz-bucket?project=wz-workload-viz',
-      },
-    });
-
     return nodes;
-  }, [stepStatuses, selectedStep]);
+  }, [stepStatuses, selectedStep, workbenchUrl, WORKBENCH_Y, BUCKET_Y, LAUNCH_Y]);
 
   const generateEdges = useCallback((): Edge[] => {
     const edges: Edge[] = [];
 
-    // Setup edges
-    SETUP_STEPS.slice(0, -1).forEach((step, index) => {
+    // Infrastructure edges (vertical flow)
+    INFRA_STEPS.slice(0, -1).forEach((step, index) => {
       edges.push({
-        id: `e-${step.id}-${SETUP_STEPS[index + 1].id}`,
-        source: step.id, target: SETUP_STEPS[index + 1].id,
+        id: `e-${step.id}-${INFRA_STEPS[index + 1].id}`,
+        source: step.id, target: INFRA_STEPS[index + 1].id,
         sourceHandle: 'source-bottom', targetHandle: 'target-top',
         type: 'straight',
         animated: stepStatuses[step.id]?.status === 'complete',
@@ -249,17 +338,37 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
       });
     });
 
-    // Write Config → Launch Pipeline
+    // VPC Network (bottom) → Provision Workbench (top) - smooth bezier curve
     edges.push({
-      id: 'e-config-launch',
-      source: 'write-config', target: 'launch-pipeline',
-      sourceHandle: 'source-right', targetHandle: 'target-left',
-      type: 'smoothstep',
-      animated: stepStatuses['write-config']?.status === 'complete',
-      style: { stroke: stepStatuses['write-config']?.status === 'complete' ? '#4CAF50' : '#DADCE0', strokeWidth: 2 },
+      id: 'e-network-workbench',
+      source: 'create-network', target: 'provision-workbench',
+      sourceHandle: 'source-bottom', targetHandle: 'target-top',
+      type: 'default',
+      animated: stepStatuses['create-network']?.status === 'complete',
+      style: { stroke: stepStatuses['create-network']?.status === 'complete' ? '#4CAF50' : '#DADCE0', strokeWidth: 2 },
     });
 
-    // Launch → INDEX and FASTQC (run in parallel)
+    // Workbench (right) → Storage Bucket (left)
+    edges.push({
+      id: 'e-workbench-bucket',
+      source: 'provision-workbench', target: 'storage-bucket',
+      sourceHandle: 'source-right', targetHandle: 'target-left',
+      type: 'smoothstep',
+      animated: stepStatuses['provision-workbench']?.status === 'complete',
+      style: { stroke: stepStatuses['provision-workbench']?.status === 'complete' ? '#4CAF50' : '#DADCE0', strokeWidth: 2 },
+    });
+
+    // Storage Bucket (top) → Launch Pipeline (bottom) - vertical line
+    edges.push({
+      id: 'e-bucket-launch',
+      source: 'storage-bucket', target: 'launch-pipeline',
+      sourceHandle: 'source-top', targetHandle: 'target-bottom',
+      type: 'straight',
+      animated: stepStatuses['storage-bucket']?.status === 'complete',
+      style: { stroke: stepStatuses['storage-bucket']?.status === 'complete' ? '#4CAF50' : '#DADCE0', strokeWidth: 2 },
+    });
+
+    // Launch → INDEX and FASTQC (parallel)
     ['index', 'fastqc'].forEach(taskId => {
       const isRunning = stepStatuses[taskId]?.status === 'running';
       const isComplete = stepStatuses[taskId]?.status === 'complete';
@@ -273,7 +382,7 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
       });
     });
 
-    // INDEX → QUANT (QUANT depends on INDEX)
+    // INDEX → QUANT
     edges.push({
       id: 'e-index-quant',
       source: 'index', target: 'quant',
@@ -293,7 +402,7 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
       style: { stroke: stepStatuses['multiqc']?.status === 'complete' ? '#4CAF50' : stepStatuses['fastqc']?.status === 'complete' ? '#1A73E8' : '#DADCE0', strokeWidth: 2 },
     });
 
-    // QUANT → MULTIQC (MULTIQC depends on both FASTQC and QUANT)
+    // QUANT → MULTIQC
     edges.push({
       id: 'e-quant-multiqc',
       source: 'quant', target: 'multiqc',
@@ -303,16 +412,37 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
       style: { stroke: stepStatuses['multiqc']?.status === 'complete' ? '#4CAF50' : stepStatuses['quant']?.status === 'complete' ? '#1A73E8' : '#DADCE0', strokeWidth: 2 },
     });
 
-    // QUANT and MULTIQC → Results
-    ['quant', 'multiqc'].forEach(taskId => {
-      edges.push({
-        id: `e-${taskId}-results`,
-        source: taskId, target: 'results',
-        sourceHandle: 'source-right', targetHandle: 'target-left',
-        type: 'smoothstep',
-        animated: stepStatuses[taskId]?.status === 'complete',
-        style: { stroke: stepStatuses[taskId]?.status === 'complete' ? '#4CAF50' : '#DADCE0', strokeWidth: 2 },
-      });
+    // QUANT → Bucket (loop back - from right side to bucket's right side)
+    const quantComplete = stepStatuses['quant']?.status === 'complete';
+    edges.push({
+      id: 'e-quant-bucket',
+      source: 'quant', target: 'storage-bucket',
+      sourceHandle: 'source-right', targetHandle: 'target-right',
+      type: 'smoothstep',
+      animated: quantComplete,
+      style: { 
+        stroke: quantComplete ? '#9C27B0' : '#DADCE0', 
+        strokeWidth: 2,
+        strokeDasharray: quantComplete ? '0' : '5,5',
+      },
+    });
+
+    // MULTIQC → Bucket (loop back - from right side to bucket's right side)
+    const multiqcComplete = stepStatuses['multiqc']?.status === 'complete';
+    edges.push({
+      id: 'e-multiqc-bucket',
+      source: 'multiqc', target: 'storage-bucket',
+      sourceHandle: 'source-right', targetHandle: 'target-right',
+      type: 'smoothstep',
+      animated: multiqcComplete,
+      style: { 
+        stroke: multiqcComplete ? '#9C27B0' : '#DADCE0', 
+        strokeWidth: 2,
+        strokeDasharray: multiqcComplete ? '0' : '5,5',
+      },
+      label: multiqcComplete ? '📊 Results in Bucket' : '',
+      labelStyle: { fill: '#9C27B0', fontWeight: 600, fontSize: 11 },
+      labelBgStyle: { fill: 'white', fillOpacity: 0.9 },
     });
 
     return edges;
@@ -324,7 +454,7 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
   useEffect(() => {
     setNodes(generateNodes());
     setEdges(generateEdges());
-  }, [stepStatuses, selectedStep, generateNodes, generateEdges, setNodes, setEdges]);
+  }, [stepStatuses, selectedStep, workbenchUrl, generateNodes, generateEdges, setNodes, setEdges]);
 
   const addLog = (stepId: string, message: string, type: 'info' | 'success' | 'error' = 'info') => {
     const timestamp = new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -366,7 +496,10 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
             try {
               const data = JSON.parse(line.substring(6));
               
-              // Handle task-specific updates (for real-time task status during pipeline)
+              if (data.workbenchUrl) {
+                setWorkbenchUrl(data.workbenchUrl);
+              }
+              
               if (data.type === 'task_update' && data.task) {
                 const taskStatus = data.status as 'running' | 'complete' | 'error';
                 setStepStatuses(prev => ({
@@ -382,10 +515,8 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
                 }));
               }
               
-              // Handle regular log messages
               if (data.log) addLog(stepId, data.log, data.type || 'info');
               
-              // Handle step completion
               if (data.status === 'complete') {
                 setStepStatuses(prev => ({ ...prev, [stepId]: { ...prev[stepId], status: 'complete' } }));
               } else if (data.status === 'error') {
@@ -410,32 +541,40 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
     abortControllerRef.current = abortController;
     setIsRunning(true);
 
-    // Zoom to setup nodes
     zoomToSetup();
 
-    // Run setup steps sequentially
+    // Run infrastructure setup steps
     setCurrentPhase('setup');
-    for (const step of SETUP_STEPS) {
+    for (const step of INFRA_STEPS) {
       if (abortController.signal.aborted) break;
       const success = await runStep(step.id, step.label, abortController.signal);
       if (!success) break;
     }
 
-    // Zoom to pipeline nodes
+    // Provision workbench
+    if (!abortController.signal.aborted) {
+      const success = await runStep('provision-workbench', 'Provision Workbench', abortController.signal);
+      if (!success) { setIsRunning(false); return; }
+    }
+
+    // Storage bucket (researcher step)
+    if (!abortController.signal.aborted) {
+      const success = await runStep('storage-bucket', 'Storage Bucket', abortController.signal);
+      if (!success) { setIsRunning(false); return; }
+    }
+
     zoomToPipeline();
 
-    // Run pipeline steps
+    // Run pipeline
     setCurrentPhase('pipeline');
     
     let success = await runStep('launch-pipeline', 'Launch Pipeline', abortController.signal);
     if (!success) { setIsRunning(false); return; }
 
-    const parallelPromises = ['fastqc', 'quant', 'multiqc'].map(taskId =>
+    const parallelPromises = ['index', 'fastqc', 'quant', 'multiqc'].map(taskId =>
       runStep(taskId, taskId.toUpperCase(), abortController.signal)
     );
     await Promise.all(parallelPromises);
-
-    await runStep('results', 'GCS Results', abortController.signal);
 
     setIsRunning(false);
     if (onComplete) onComplete();
@@ -447,7 +586,17 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
   };
 
   const selectedStepLogs = selectedStep ? stepStatuses[selectedStep]?.logs || [] : [];
-  const allSteps = [...SETUP_STEPS, ...PIPELINE_STEPS];
+  
+  const allSteps = [
+    ...INFRA_STEPS,
+    { id: 'provision-workbench', label: 'Provision Workbench', command: 'Vertex AI Workbench', icon: 'terminal' },
+    { id: 'storage-bucket', label: 'Storage Bucket', command: 'gs://wz-workload-viz-bucket', icon: 'cloud_upload' },
+    { id: 'launch-pipeline', label: 'Launch Pipeline', command: 'nextflow run nextflow-io/rnaseq-nf', icon: 'play_arrow' },
+    { id: 'index', label: 'INDEX', command: 'salmon index (~9 min)', icon: 'inventory_2' },
+    { id: 'fastqc', label: 'FASTQC', command: 'Quality Control (~11s)', icon: 'biotech' },
+    { id: 'quant', label: 'QUANT', command: 'Quantification (~9 min)', icon: 'calculate' },
+    { id: 'multiqc', label: 'MULTIQC', command: 'Report Aggregation (~13s)', icon: 'summarize' },
+  ];
   const selectedStepData = allSteps.find(s => s.id === selectedStep);
 
   return (
@@ -457,7 +606,7 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
           <span className="material-symbols-outlined header-icon">cloud_sync</span>
           <div>
             <h1 className="title-large">Nextflow on Google Cloud Batch</h1>
-            <p className="body-medium header-subtitle">Workload Visualization</p>
+            <p className="body-medium header-subtitle">Infrastructure + Researcher Workflow Visualization</p>
           </div>
         </div>
         <div className="header-right">
@@ -507,7 +656,6 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
   );
 };
 
-// Wrapper component with ReactFlowProvider
 interface WorkloadFlowProps {
   onComplete?: () => void;
 }
