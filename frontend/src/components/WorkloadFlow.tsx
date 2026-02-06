@@ -80,6 +80,7 @@ const INFRA_STEPS = [
   { id: 'iam-roles', label: 'Add IAM Roles', command: '5 roles granted', icon: 'security' },
   { id: 'org-policies', label: 'Configure Org Policies', command: 'VM + Image exceptions', icon: 'policy' },
   { id: 'create-network', label: 'Create VPC Network', command: 'default + firewall + PGA', icon: 'lan' },
+  { id: 'configure-cloud-nat', label: 'Configure Cloud NAT', command: 'Router + NAT for outbound', icon: 'router' },
 ];
 
 const GCP_DIFFERENTIATORS_INDEX = `🧬 Salmon Index Creation:
@@ -103,7 +104,10 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
   const [selectedStep, setSelectedStep] = useState<string | null>(null);
   const [currentPhase, setCurrentPhase] = useState<'setup' | 'pipeline'>('setup');
   const [workbenchUrl, setWorkbenchUrl] = useState<string | null>(null);
+  const [isMonitoringMode, setIsMonitoringMode] = useState(false);
+  const [jupyterUrl, setJupyterUrl] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const { setViewport } = useReactFlow();
 
   // Layout constants
@@ -338,14 +342,14 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
       });
     });
 
-    // VPC Network (bottom) → Provision Workbench (top) - smooth bezier curve
+    // Cloud NAT (bottom) → Provision Workbench (top) - smooth bezier curve
     edges.push({
-      id: 'e-network-workbench',
-      source: 'create-network', target: 'provision-workbench',
+      id: 'e-nat-workbench',
+      source: 'configure-cloud-nat', target: 'provision-workbench',
       sourceHandle: 'source-bottom', targetHandle: 'target-top',
       type: 'default',
-      animated: stepStatuses['create-network']?.status === 'complete',
-      style: { stroke: stepStatuses['create-network']?.status === 'complete' ? '#4CAF50' : '#DADCE0', strokeWidth: 2 },
+      animated: stepStatuses['configure-cloud-nat']?.status === 'complete',
+      style: { stroke: stepStatuses['configure-cloud-nat']?.status === 'complete' ? '#4CAF50' : '#DADCE0', strokeWidth: 2 },
     });
 
     // Workbench (right) → Storage Bucket (left)
@@ -535,11 +539,134 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
     }
   };
 
+  // Polling function to check researcher-triggered resources
+  const pollResources = useCallback(async () => {
+    console.log('[POLL] Polling for researcher resources...');
+    try {
+      const response = await fetch('/api/poll-all');
+      if (!response.ok) return;
+      
+      const data = await response.json();
+      console.log('[POLL] Response:', JSON.stringify(data, null, 2));
+      
+      // Update bucket status
+      if (data.bucket) {
+        const bucketStatus = data.bucket.exists ? 'complete' : 'pending';
+        setStepStatuses(prev => {
+          // Only update if status changed
+          if (prev['storage-bucket']?.status !== bucketStatus) {
+            const timestamp = new Date().toLocaleTimeString('en-US', { hour12: false });
+            const logs = prev['storage-bucket']?.logs || [];
+            const newLogs = bucketStatus === 'complete' 
+              ? [...logs, { timestamp, message: `✓ Bucket detected: gs://wz-workload-viz-bucket (${data.bucket.location})`, type: 'success' as const }]
+              : logs;
+            return {
+              ...prev,
+              'storage-bucket': { status: bucketStatus, logs: newLogs }
+            };
+          }
+          return prev;
+        });
+      }
+      
+      // Update pipeline task statuses from Batch jobs
+      if (data.jobs?.taskStatuses) {
+        const taskStatuses = data.jobs.taskStatuses;
+        const pipelineTasks = ['index', 'fastqc', 'quant', 'multiqc'];
+        
+        setStepStatuses(prev => {
+          const updates: Record<string, StepStatus> = {};
+          let hasUpdates = false;
+          
+          for (const taskId of pipelineTasks) {
+            const newStatus = taskStatuses[taskId] as 'pending' | 'running' | 'complete';
+            if (newStatus && prev[taskId]?.status !== newStatus) {
+              hasUpdates = true;
+              const timestamp = new Date().toLocaleTimeString('en-US', { hour12: false });
+              const logs = prev[taskId]?.logs || [];
+              const statusMessage = newStatus === 'complete' 
+                ? `✓ ${taskId.toUpperCase()} completed (Batch job succeeded)`
+                : newStatus === 'running'
+                ? `▶ ${taskId.toUpperCase()} running on Google Batch...`
+                : '';
+              
+              updates[taskId] = {
+                status: newStatus,
+                logs: statusMessage ? [...logs, { timestamp, message: statusMessage, type: newStatus === 'complete' ? 'success' as const : 'info' as const }] : logs
+              };
+            }
+          }
+          
+          // Also update launch-pipeline if any task is running
+          if (data.pipelineRunning && prev['launch-pipeline']?.status !== 'running') {
+            hasUpdates = true;
+            const timestamp = new Date().toLocaleTimeString('en-US', { hour12: false });
+            updates['launch-pipeline'] = {
+              status: 'running',
+              logs: [...(prev['launch-pipeline']?.logs || []), { timestamp, message: '▶ Pipeline detected running on Google Batch', type: 'info' as const }]
+            };
+          } else if (data.allComplete && prev['launch-pipeline']?.status !== 'complete') {
+            hasUpdates = true;
+            const timestamp = new Date().toLocaleTimeString('en-US', { hour12: false });
+            updates['launch-pipeline'] = {
+              status: 'complete',
+              logs: [...(prev['launch-pipeline']?.logs || []), { timestamp, message: '✓ Pipeline completed successfully!', type: 'success' as const }]
+            };
+          }
+          
+          return hasUpdates ? { ...prev, ...updates } : prev;
+        });
+      }
+      
+      // If all tasks complete, stop polling
+      if (data.allComplete) {
+        console.log('[POLL] All tasks complete, stopping polling');
+        stopPolling();
+        if (onComplete) onComplete();
+      }
+      
+    } catch (error) {
+      console.error('[POLL] Error polling resources:', error);
+    }
+  }, [onComplete]);
+
+  // Start polling for researcher resources
+  const startPolling = useCallback(() => {
+    console.log('[MONITORING] Starting polling mode...');
+    setIsMonitoringMode(true);
+    
+    // Initial poll immediately
+    pollResources();
+    
+    // Then poll every 5 seconds
+    pollingIntervalRef.current = setInterval(pollResources, 5000);
+  }, [pollResources]);
+
+  // Stop polling
+  const stopPolling = useCallback(() => {
+    console.log('[MONITORING] Stopping polling mode');
+    if (pollingIntervalRef.current) {
+      clearInterval(pollingIntervalRef.current);
+      pollingIntervalRef.current = null;
+    }
+    setIsMonitoringMode(false);
+  }, []);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
+      }
+    };
+  }, []);
+
   const runAllSteps = async () => {
     if (abortControllerRef.current) abortControllerRef.current.abort();
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
     setIsRunning(true);
+    stopPolling(); // Ensure no old polling is running
 
     zoomToSetup();
 
@@ -554,34 +681,50 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
     // Provision workbench
     if (!abortController.signal.aborted) {
       const success = await runStep('provision-workbench', 'Provision Workbench', abortController.signal);
-      if (!success) { setIsRunning(false); return; }
+      if (!success) { 
+        setIsRunning(false); 
+        return; 
+      }
     }
 
-    // Storage bucket (researcher step)
-    if (!abortController.signal.aborted) {
-      const success = await runStep('storage-bucket', 'Storage Bucket', abortController.signal);
-      if (!success) { setIsRunning(false); return; }
-    }
-
-    zoomToPipeline();
-
-    // Run pipeline
-    setCurrentPhase('pipeline');
-    
-    let success = await runStep('launch-pipeline', 'Launch Pipeline', abortController.signal);
-    if (!success) { setIsRunning(false); return; }
-
-    const parallelPromises = ['index', 'fastqc', 'quant', 'multiqc'].map(taskId =>
-      runStep(taskId, taskId.toUpperCase(), abortController.signal)
-    );
-    await Promise.all(parallelPromises);
-
+    // After workbench is provisioned, STOP and enter monitoring mode
+    // The researcher will run the remaining steps from the notebook cells
     setIsRunning(false);
-    if (onComplete) onComplete();
+    
+    // Add log indicating we're now in monitoring mode
+    const timestamp = new Date().toLocaleTimeString('en-US', { hour12: false });
+    setStepStatuses(prev => ({
+      ...prev,
+      'provision-workbench': {
+        ...prev['provision-workbench'],
+        logs: [
+          ...(prev['provision-workbench']?.logs || []),
+          { timestamp, message: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━', type: 'info' as const },
+          { timestamp, message: '🔬 Workbench ready! Open JupyterLab to continue.', type: 'success' as const },
+          { timestamp, message: '📓 Run notebook cells to create bucket & launch pipeline', type: 'info' as const },
+          { timestamp, message: '👁️ Monitoring mode active - watching for changes...', type: 'info' as const },
+        ]
+      },
+      'storage-bucket': {
+        status: 'pending',
+        logs: [{ timestamp, message: '⏳ Waiting for researcher to create bucket from notebook...', type: 'info' as const }]
+      },
+      'launch-pipeline': {
+        status: 'pending',
+        logs: [{ timestamp, message: '⏳ Waiting for researcher to launch pipeline from notebook...', type: 'info' as const }]
+      }
+    }));
+
+    // Zoom to show full view including researcher area
+    zoomToPipeline();
+    
+    // Start polling for bucket and pipeline status
+    startPolling();
   };
 
   const stopExecution = () => {
     if (abortControllerRef.current) abortControllerRef.current.abort();
+    stopPolling();
     setIsRunning(false);
   };
 
@@ -606,19 +749,34 @@ const WorkloadFlowInner: React.FC<WorkloadFlowInnerProps> = ({ onComplete }) => 
           <span className="material-symbols-outlined header-icon">cloud_sync</span>
           <div>
             <h1 className="title-large">Nextflow on Google Cloud Batch</h1>
-            <p className="body-medium header-subtitle">Infrastructure + Researcher Workflow Visualization</p>
+            <p className="body-medium header-subtitle">
+              {isMonitoringMode 
+                ? '👁️ Monitoring Mode - Watching for researcher actions in notebook'
+                : 'Infrastructure + Researcher Workflow Visualization'}
+            </p>
           </div>
         </div>
         <div className="header-right">
-          {!isRunning ? (
-            <button className="run-button" onClick={runAllSteps}>
-              <span className="material-symbols-outlined">play_arrow</span>
-              <span className="label-large">Run Workflow</span>
-            </button>
-          ) : (
+          {isMonitoringMode && (
+            <div className="monitoring-indicator">
+              <span className="material-symbols-outlined pulse-icon">visibility</span>
+              <span className="label-medium">Monitoring</span>
+            </div>
+          )}
+          {isRunning ? (
             <button className="stop-button" onClick={stopExecution}>
               <span className="material-symbols-outlined">stop</span>
               <span className="label-large">Stop</span>
+            </button>
+          ) : isMonitoringMode ? (
+            <button className="stop-button" onClick={stopPolling} style={{ background: '#5F6368' }}>
+              <span className="material-symbols-outlined">visibility_off</span>
+              <span className="label-large">Stop Monitoring</span>
+            </button>
+          ) : (
+            <button className="run-button" onClick={runAllSteps}>
+              <span className="material-symbols-outlined">play_arrow</span>
+              <span className="label-large">Run Workflow</span>
             </button>
           )}
         </div>

@@ -376,10 +376,124 @@ def execute_create_network():
         yield step_error(str(e))
 
 
+def execute_configure_cloud_nat():
+    """
+    Configure Cloud NAT to allow VMs without public IPs to access the internet.
+    This is required for the workbench to download packages like Java and Nextflow.
+    """
+    yield log_msg("Configuring Cloud NAT for outbound internet access...")
+    
+    try:
+        credentials, project = default()
+        compute_service = discovery.build('compute', 'v1', credentials=credentials)
+        
+        router_name = 'nat-router'
+        nat_name = 'nat-config'
+        
+        # Check if router already exists
+        try:
+            compute_service.routers().get(
+                project=PROJECT_ID,
+                region=REGION,
+                router=router_name
+            ).execute()
+            yield log_msg(f"  ✓ Cloud Router '{router_name}' already exists", "info")
+        except Exception as e:
+            if 'notFound' in str(e).lower() or '404' in str(e):
+                yield log_msg(f"  Creating Cloud Router '{router_name}'...")
+                
+                router_body = {
+                    'name': router_name,
+                    'network': f'projects/{PROJECT_ID}/global/networks/default',
+                    'region': REGION
+                }
+                
+                operation = compute_service.routers().insert(
+                    project=PROJECT_ID,
+                    region=REGION,
+                    body=router_body
+                ).execute()
+                
+                # Wait for operation
+                yield log_msg("  Waiting for router creation...")
+                while True:
+                    result = compute_service.regionOperations().get(
+                        project=PROJECT_ID,
+                        region=REGION,
+                        operation=operation['name']
+                    ).execute()
+                    if result['status'] == 'DONE':
+                        break
+                    time.sleep(2)
+                
+                yield log_msg(f"  ✓ Cloud Router '{router_name}' created", "success")
+            else:
+                raise e
+        
+        # Check if NAT config already exists on the router
+        try:
+            router = compute_service.routers().get(
+                project=PROJECT_ID,
+                region=REGION,
+                router=router_name
+            ).execute()
+            
+            existing_nats = router.get('nats', [])
+            nat_exists = any(n.get('name') == nat_name for n in existing_nats)
+            
+            if nat_exists:
+                yield log_msg(f"  ✓ NAT config '{nat_name}' already exists", "info")
+            else:
+                yield log_msg(f"  Adding NAT config '{nat_name}' to router...")
+                
+                # Add NAT configuration to the router
+                nat_config = {
+                    'name': nat_name,
+                    'natIpAllocateOption': 'AUTO_ONLY',
+                    'sourceSubnetworkIpRangesToNat': 'ALL_SUBNETWORKS_ALL_IP_RANGES',
+                    'logConfig': {
+                        'enable': False,
+                        'filter': 'ALL'
+                    }
+                }
+                
+                router['nats'] = existing_nats + [nat_config]
+                
+                operation = compute_service.routers().patch(
+                    project=PROJECT_ID,
+                    region=REGION,
+                    router=router_name,
+                    body=router
+                ).execute()
+                
+                # Wait for operation
+                yield log_msg("  Waiting for NAT configuration...")
+                while True:
+                    result = compute_service.regionOperations().get(
+                        project=PROJECT_ID,
+                        region=REGION,
+                        operation=operation['name']
+                    ).execute()
+                    if result['status'] == 'DONE':
+                        break
+                    time.sleep(2)
+                
+                yield log_msg(f"  ✓ NAT config '{nat_name}' added", "success")
+        except Exception as e:
+            raise e
+        
+        yield log_msg("  Cloud NAT enables outbound internet for private VMs", "info")
+        yield log_msg("  Workbench can now install packages (Java, Nextflow)", "info")
+        yield step_complete()
+    except Exception as e:
+        yield step_error(str(e))
+
+
 def execute_provision_workbench():
     """
     Provision a Vertex AI Workbench instance for researchers.
-    Uses the Notebooks API (notebooks.googleapis.com) to create a managed notebook instance.
+    Uses the Notebooks API v2 (notebooks.googleapis.com/v2) to create a Workbench Instance.
+    The v1 API for user-managed notebooks has been deprecated.
     If instance already exists, returns the URL to access it.
     """
     yield log_msg(f"Provisioning Vertex AI Workbench: {WORKBENCH_INSTANCE_NAME}...")
@@ -401,9 +515,10 @@ def execute_provision_workbench():
             else:
                 yield log_msg(f"  ⚠ Notebooks API: {str(e)[:80]}", "info")
         
-        # Build the Notebooks API client
-        notebooks_service = discovery.build('notebooks', 'v1', credentials=credentials)
+        # Build the Notebooks API v2 client (v1 is deprecated for new instances)
+        notebooks_service = discovery.build('notebooks', 'v2', credentials=credentials)
         
+        # v2 API still uses zone for location (not region)
         instance_name = f"projects/{PROJECT_ID}/locations/{ZONE}/instances/{WORKBENCH_INSTANCE_NAME}"
         workbench_url = f"https://console.cloud.google.com/vertex-ai/workbench/instances?project={PROJECT_ID}"
         jupyter_url = None
@@ -418,7 +533,7 @@ def execute_provision_workbench():
             state = instance.get('state', 'UNKNOWN')
             yield log_msg(f"  ✓ Workbench instance already exists (state: {state})", "info")
             
-            # Get the proxy URI for JupyterLab access
+            # v2 API uses 'proxyUri' for JupyterLab access
             if 'proxyUri' in instance:
                 jupyter_url = instance['proxyUri']
                 yield log_msg(f"  JupyterLab URL: {jupyter_url}", "success")
@@ -439,13 +554,18 @@ def execute_provision_workbench():
                 raise e
             yield log_msg(f"  Instance not found, creating new workbench...", "info")
         
-        # Create the Workbench instance
+        # Create the Workbench instance using v2 API
         sa_email = f"{SERVICE_ACCOUNT_NAME}@{PROJECT_ID}.iam.gserviceaccount.com"
         
         # Startup script to install Nextflow and configure the environment
         startup_script = f'''#!/bin/bash
-# Install Java (required for Nextflow)
-apt-get update && apt-get install -y default-jdk
+# Install Java 17 (required for Nextflow 24+)
+apt-get update && apt-get install -y openjdk-17-jdk
+
+# Set JAVA_HOME for Nextflow
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+echo 'export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64' >> /etc/profile.d/java.sh
+echo 'export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64' >> /home/jupyter/.bashrc
 
 # Install Nextflow
 curl -s https://get.nextflow.io | bash
@@ -489,6 +609,18 @@ cat > /home/jupyter/nextflow-workspace/Getting_Started_RNAseq.ipynb << 'NOTEBOOK
       "cell_type": "markdown",
       "metadata": {{}},
       "source": ["# 🧬 Getting Started with Nextflow on Google Cloud Batch\\n", "\\n", "This notebook walks you through running an RNAseq pipeline using Nextflow on Google Cloud Batch."]
+    }},
+    {{
+      "cell_type": "markdown",
+      "metadata": {{}},
+      "source": ["## Step 0: Install Nextflow\\n", "\\n", "First, we need to install Java and Nextflow. This only needs to be done once."]
+    }},
+    {{
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {{}},
+      "outputs": [],
+      "source": ["!sudo apt-get update -qq && sudo apt-get install -y -qq openjdk-17-jdk\\n", "!export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 && curl -s https://get.nextflow.io | bash && sudo mv nextflow /usr/local/bin/\\n", "!export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 && nextflow -version"]
     }},
     {{
       "cell_type": "markdown",
@@ -578,27 +710,45 @@ NOTEBOOK
 chown -R jupyter:jupyter /home/jupyter/nextflow-workspace
 '''
 
+        # v2 API instance body structure with gceSetup
         instance_body = {
-            'vmImage': {
-                'project': 'deeplearning-platform-release',
-                'imageFamily': 'common-cpu-notebooks'
-            },
-            'machineType': 'n1-standard-4',
-            'serviceAccount': sa_email,
-            'network': f'projects/{PROJECT_ID}/global/networks/default',
-            'subnet': f'projects/{PROJECT_ID}/regions/{REGION}/subnetworks/default',
-            'noPublicIp': True,  # Use internal IP only (org policy compliance)
-            'metadata': {
-                'startup-script': startup_script,
-                'proxy-mode': 'service_account'
-            },
-            'postStartupScript': startup_script
+            'gceSetup': {
+                'machineType': 'n1-standard-4',
+                'serviceAccounts': [
+                    {
+                        'email': sa_email,
+                        'scopes': ['https://www.googleapis.com/auth/cloud-platform']
+                    }
+                ],
+                'networkInterfaces': [
+                    {
+                        'network': f'projects/{PROJECT_ID}/global/networks/default',
+                        'subnet': f'projects/{PROJECT_ID}/regions/{REGION}/subnetworks/default',
+                        'nicType': 'VIRTIO_NET'
+                    }
+                ],
+                'disablePublicIp': True,  # Use internal IP only (org policy compliance)
+                'metadata': {
+                    'startup-script': startup_script,
+                    'proxy-mode': 'service_account'
+                },
+                'bootDisk': {
+                    'diskSizeGb': '150',
+                    'diskType': 'PD_BALANCED'
+                },
+                'vmImage': {
+                    'project': 'cloud-notebooks-managed',
+                    'name': 'workbench-instances-v20260122'
+                }
+            }
         }
         
         yield log_msg("  Creating Workbench instance (this takes 3-5 minutes)...", "info")
         yield log_msg(f"  Machine: n1-standard-4, Zone: {ZONE}", "info")
         yield log_msg(f"  Network: default (no public IP)", "info")
+        yield log_msg(f"  Using Notebooks API v2 (Workbench Instances)", "info")
         
+        # v2 API uses zone for location
         operation = notebooks_service.projects().locations().instances().create(
             parent=f"projects/{PROJECT_ID}/locations/{ZONE}",
             instanceId=WORKBENCH_INSTANCE_NAME,
@@ -915,6 +1065,7 @@ STEP_EXECUTORS = {
     'iam-roles': execute_iam_roles,
     'org-policies': execute_configure_org_policies,
     'create-network': execute_create_network,
+    'configure-cloud-nat': execute_configure_cloud_nat,
     # Researcher environment provisioning
     'provision-workbench': execute_provision_workbench,
     # Researcher workflow (triggered from notebook cells, but we visualize)
@@ -1085,14 +1236,17 @@ def poll_jobs():
 def get_workbench_status():
     """
     Get the current status and URL of the Vertex AI Workbench instance.
+    Uses v2 API with zone-based location.
     Used by frontend to display link to workbench and check if it's ready.
     """
-    print(f"\n[WORKBENCH] Checking workbench status...")
+    print(f"\n[WORKBENCH] Checking workbench status (v2 API, zone: {ZONE})...")
     
     try:
         credentials, project = default()
-        notebooks_service = discovery.build('notebooks', 'v1', credentials=credentials)
+        # Use v2 API for Workbench Instances
+        notebooks_service = discovery.build('notebooks', 'v2', credentials=credentials)
         
+        # v2 API uses zone for location
         instance_name = f"projects/{PROJECT_ID}/locations/{ZONE}/instances/{WORKBENCH_INSTANCE_NAME}"
         
         try:
@@ -1134,6 +1288,339 @@ def get_workbench_status():
             'exists': False,
             'ready': False
         }), 500
+
+
+@app.route('/api/poll-bucket-status', methods=['GET'])
+def poll_bucket_status():
+    """
+    Poll for bucket existence and metadata.
+    Used by frontend to detect when researcher creates the bucket from notebook.
+    Returns bucket info if exists, or not_found status.
+    """
+    print(f"\n[POLL-BUCKET] Checking bucket: gs://{BUCKET_NAME}")
+    
+    try:
+        client = storage.Client(project=PROJECT_ID)
+        
+        try:
+            bucket = client.get_bucket(BUCKET_NAME)
+            
+            # Get some metadata about the bucket
+            blob_count = 0
+            scratch_files = []
+            try:
+                blobs = list(bucket.list_blobs(prefix="scratch/", max_results=50))
+                blob_count = len(blobs)
+                scratch_files = [{'name': b.name, 'size': b.size, 'updated': b.updated.isoformat() if b.updated else None} for b in blobs[:10]]
+            except Exception:
+                pass
+            
+            response_data = {
+                'exists': True,
+                'bucketName': BUCKET_NAME,
+                'bucketUrl': f'https://console.cloud.google.com/storage/browser/{BUCKET_NAME}?project={PROJECT_ID}',
+                'location': bucket.location,
+                'storageClass': bucket.storage_class,
+                'created': bucket.time_created.isoformat() if bucket.time_created else None,
+                'scratchFileCount': blob_count,
+                'scratchFiles': scratch_files,
+                'status': 'complete'
+            }
+            
+            print(f"[POLL-BUCKET] Bucket exists: {BUCKET_NAME}, scratch files: {blob_count}")
+            return jsonify(response_data)
+            
+        except gcp_exceptions.NotFound:
+            print(f"[POLL-BUCKET] Bucket not found: {BUCKET_NAME}")
+            return jsonify({
+                'exists': False,
+                'bucketName': BUCKET_NAME,
+                'status': 'pending'
+            })
+            
+    except Exception as e:
+        print(f"[POLL-BUCKET ERROR] {str(e)}")
+        return jsonify({
+            'error': str(e),
+            'exists': False,
+            'status': 'error'
+        }), 500
+
+
+@app.route('/api/poll-pipeline-logs', methods=['GET'])
+def poll_pipeline_logs():
+    """
+    Poll Cloud Logging for Nextflow/Batch pipeline logs.
+    Returns recent log entries for the pipeline execution.
+    Used by frontend to display real-time logs from notebook-triggered pipeline.
+    """
+    print(f"\n[POLL-LOGS] Polling Cloud Logging for pipeline logs...")
+    
+    try:
+        from google.cloud import logging as cloud_logging
+        
+        client = cloud_logging.Client(project=PROJECT_ID)
+        
+        # Query for Batch-related logs (Nextflow jobs running on Batch)
+        # Filter for logs from the last hour
+        filter_str = f'''
+            resource.type="cloud_batch_job" OR 
+            resource.type="cloud_batch_task" OR
+            (resource.type="gce_instance" AND textPayload:("nextflow" OR "nf-" OR "RNASEQ"))
+        '''
+        
+        entries = list(client.list_entries(
+            filter_=filter_str,
+            order_by=cloud_logging.DESCENDING,
+            max_results=50
+        ))
+        
+        logs = []
+        for entry in entries:
+            log_entry = {
+                'timestamp': entry.timestamp.isoformat() if entry.timestamp else None,
+                'severity': entry.severity if hasattr(entry, 'severity') else 'INFO',
+                'message': str(entry.payload) if entry.payload else '',
+                'resource': entry.resource.type if entry.resource else 'unknown',
+                'labels': dict(entry.labels) if entry.labels else {}
+            }
+            logs.append(log_entry)
+        
+        # Also check for Nextflow-specific patterns in the logs
+        pipeline_status = 'unknown'
+        for log in logs:
+            msg = log.get('message', '').upper()
+            if 'COMPLETED' in msg or 'SUCCEEDED' in msg:
+                pipeline_status = 'complete'
+                break
+            elif 'ERROR' in msg or 'FAILED' in msg:
+                pipeline_status = 'error'
+                break
+            elif 'RUNNING' in msg or 'SUBMITTED' in msg:
+                pipeline_status = 'running'
+        
+        response_data = {
+            'logs': logs,
+            'logCount': len(logs),
+            'pipelineStatus': pipeline_status
+        }
+        
+        print(f"[POLL-LOGS] Found {len(logs)} log entries, pipeline status: {pipeline_status}")
+        return jsonify(response_data)
+        
+    except ImportError:
+        print(f"[POLL-LOGS] google-cloud-logging not installed")
+        return jsonify({
+            'logs': [],
+            'logCount': 0,
+            'pipelineStatus': 'unknown',
+            'error': 'Cloud Logging client not available'
+        })
+    except Exception as e:
+        print(f"[POLL-LOGS ERROR] {str(e)}")
+        return jsonify({
+            'error': str(e),
+            'logs': [],
+            'logCount': 0,
+            'pipelineStatus': 'unknown'
+        }), 500
+
+
+def get_process_name_from_job(job, storage_client):
+    """
+    Extract process name from a Nextflow Batch job by reading .command.run from GCS.
+    
+    The job's container command contains the work directory path like:
+    /mnt/disks/BUCKET/scratch/XX/HASH/.command.run
+    
+    The .command.run file contains a YAML header with: ### name: 'PROCESS_NAME'
+    
+    Returns the process name (e.g., 'RNASEQ_INDEX', 'FASTQC', 'MULTIQC') or None.
+    """
+    import re
+    
+    try:
+        # Extract work dir from container command
+        task_groups = job.get('taskGroups', [])
+        if not task_groups:
+            return None
+        
+        runnables = task_groups[0].get('taskSpec', {}).get('runnables', [])
+        if not runnables:
+            return None
+        
+        container = runnables[0].get('container', {})
+        commands = container.get('commands', [])
+        
+        # Find the command that contains .command.run path
+        for cmd in commands:
+            # Pattern: /mnt/disks/BUCKET/scratch/XX/HASH/.command.run
+            match = re.search(r'/mnt/disks/([^/]+)/scratch/([a-f0-9]{2}/[a-f0-9]+)/', cmd)
+            if match:
+                bucket_name = match.group(1)
+                work_hash = match.group(2)
+                
+                # Read .command.run from GCS
+                gcs_path = f"scratch/{work_hash}/.command.run"
+                bucket = storage_client.bucket(bucket_name)
+                blob = bucket.blob(gcs_path)
+                
+                # Download first 500 bytes (name is in the header)
+                content = blob.download_as_text()[:500]
+                
+                # Parse ### name: 'PROCESS_NAME'
+                name_match = re.search(r"### name: ['\"]?([^'\"]+)['\"]?", content)
+                if name_match:
+                    return name_match.group(1).upper()
+                
+                break
+        
+        return None
+    except Exception as e:
+        print(f"[POLL] Could not get process name: {str(e)[:50]}")
+        return None
+
+
+def map_process_to_task(process_name):
+    """Map Nextflow process name to frontend task ID"""
+    if not process_name:
+        return None
+    
+    process_upper = process_name.upper()
+    if 'INDEX' in process_upper:
+        return 'index'
+    elif 'FASTQC' in process_upper:
+        return 'fastqc'
+    elif 'QUANT' in process_upper:
+        return 'quant'
+    elif 'MULTIQC' in process_upper:
+        return 'multiqc'
+    return None
+
+
+@app.route('/api/poll-all', methods=['GET'])
+def poll_all():
+    """
+    Combined polling endpoint that returns status for all researcher-triggered resources.
+    This is called by the frontend in monitoring mode after workbench is provisioned.
+    Returns: bucket status, job statuses, and recent logs in one call.
+    
+    Uses GCS to read .command.run files and extract process names from Nextflow jobs.
+    """
+    print(f"\n[POLL-ALL] Combined polling for all resources...")
+    
+    result = {
+        'bucket': None,
+        'jobs': None,
+        'workbench': None,
+        'pipelineRunning': False,
+        'allComplete': False
+    }
+    
+    # 1. Check bucket status
+    try:
+        client = storage.Client(project=PROJECT_ID)
+        try:
+            bucket = client.get_bucket(BUCKET_NAME)
+            blob_count = 0
+            try:
+                blobs = list(bucket.list_blobs(prefix="scratch/", max_results=10))
+                blob_count = len(blobs)
+            except:
+                pass
+            
+            result['bucket'] = {
+                'exists': True,
+                'status': 'complete',
+                'location': bucket.location,
+                'scratchFileCount': blob_count
+            }
+        except gcp_exceptions.NotFound:
+            result['bucket'] = {'exists': False, 'status': 'pending'}
+    except Exception as e:
+        result['bucket'] = {'exists': False, 'status': 'error', 'error': str(e)[:100]}
+    
+    # 2. Check batch jobs - read process names from GCS .command.run files
+    storage_client = storage.Client(project=PROJECT_ID)
+    try:
+        credentials, _ = default()
+        service = discovery.build('batch', 'v1', credentials=credentials)
+        parent = f"projects/{PROJECT_ID}/locations/{REGION}"
+        response = service.projects().locations().jobs().list(parent=parent).execute()
+        
+        jobs = response.get('jobs', [])
+        nf_jobs = [j for j in jobs if j.get('name', '').split('/')[-1].startswith('nf-')]
+        nf_jobs.sort(key=lambda j: j.get('createTime', ''), reverse=True)
+        
+        task_statuses = {
+            'index': 'pending',
+            'fastqc': 'pending',
+            'quant': 'pending',
+            'multiqc': 'pending'
+        }
+        
+        recent_jobs = []
+        for job in nf_jobs[:20]:
+            job_name = job.get('name', '').split('/')[-1]
+            state = job.get('status', {}).get('state', 'UNKNOWN')
+            
+            # Get process name from GCS .command.run file
+            process_name = get_process_name_from_job(job, storage_client)
+            task_id = map_process_to_task(process_name)
+            
+            recent_jobs.append({
+                'name': job_name,
+                'state': state,
+                'createTime': job.get('createTime', ''),
+                'processName': process_name,
+                'taskId': task_id
+            })
+            
+            # Map to task statuses using the actual process name
+            if task_id:
+                if state == 'SUCCEEDED':
+                    task_statuses[task_id] = 'complete'
+                elif state in ['RUNNING', 'SCHEDULED']:
+                    # Only set to running if not already complete
+                    if task_statuses[task_id] != 'complete':
+                        task_statuses[task_id] = 'running'
+                # pending stays pending
+        
+        pipeline_running = any(s == 'running' for s in task_statuses.values())
+        all_complete = all(s == 'complete' for s in task_statuses.values())
+        
+        result['jobs'] = {
+            'taskStatuses': task_statuses,
+            'recentJobs': recent_jobs[:5],
+            'totalJobs': len(nf_jobs)
+        }
+        result['pipelineRunning'] = pipeline_running
+        result['allComplete'] = all_complete
+        
+    except Exception as e:
+        result['jobs'] = {'error': str(e)[:100], 'taskStatuses': {}}
+    
+    # 3. Check workbench status
+    try:
+        credentials, _ = default()
+        notebooks_service = discovery.build('notebooks', 'v2', credentials=credentials)
+        instance_name = f"projects/{PROJECT_ID}/locations/{ZONE}/instances/{WORKBENCH_INSTANCE_NAME}"
+        
+        try:
+            instance = notebooks_service.projects().locations().instances().get(name=instance_name).execute()
+            result['workbench'] = {
+                'exists': True,
+                'state': instance.get('state', 'UNKNOWN'),
+                'ready': instance.get('state') == 'ACTIVE',
+                'proxyUri': instance.get('proxyUri')
+            }
+        except:
+            result['workbench'] = {'exists': False, 'ready': False}
+    except Exception as e:
+        result['workbench'] = {'error': str(e)[:100]}
+    
+    print(f"[POLL-ALL] Bucket: {result['bucket'].get('status')}, Pipeline running: {result['pipelineRunning']}, All complete: {result['allComplete']}")
+    return jsonify(result)
 
 
 if __name__ == '__main__':
